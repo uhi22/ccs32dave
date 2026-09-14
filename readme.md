@@ -1,4 +1,4 @@
-# ESP32-S3 with TFT display
+# ccs32dave - The CCS Sniffer with ESP32-S3, QCA7005 modem and TFT display
 
 Arduino project that drives an **ILI9341 SPI TFT** (240×320) and a **QCA7005 HomePlug Green PHY modem** (compatible with QCA7000) from an **ESP32-S3**.
 
