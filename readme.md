@@ -1,5 +1,7 @@
 # ccs32dave - The CCS Sniffer with ESP32-S3, QCA7005 modem and TFT display
 
+![QCA7005 modem board wired to the ILI9341 TFT. The display shows the joined network, the three modems with their firmware versions, and a log of SLAC and UDP frames.](doc/2026-09-14_TFT_and_QCA_showing_SLAC_and_UDP.jpg)
+
 Arduino project that drives an **ILI9341 SPI TFT** (240×320) and a **QCA7005 HomePlug Green PHY modem** (compatible with QCA7000) from an **ESP32-S3**.
 
 The display shows:
@@ -42,6 +44,7 @@ Planned next steps are in [backlog.md](backlog.md).
 ```
 readme.md                                    this file
 backlog.md                                   planned work
+doc/                                         photos
 ccs32dave-arduino-esp32-s3-tft-ili9341.ino   Arduino sketch: display, scheduling
 qca7000.h/.cpp                               QCA7000/QCA7005 SPI driver
 homeplug.h/.cpp                              HomePlug messages (GET_SW, NW_INFO, MME names)
