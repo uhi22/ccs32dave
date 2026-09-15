@@ -125,6 +125,38 @@ last decoded message name, and its response code (owner decision: show everythin
 A vertical divider separates the two columns. Confirmed live against a real EVSE session: all panel
 fields update correctly frame by frame.
 
+## backlog_0005: fade out stale V2G values
+
+**Status:** done.
+
+Target/present voltage+current and SoC turn mid-gray after 2 s without a fresh value, dark gray after 4 s.
+
+## backlog_0006: show whether a CCo is in sight
+
+**Status:** done.
+
+When not joined, the network line shows "beacons" (orange) plus a 5-segment meter (beacons received in the last ~200 ms) while a CCo's beacons are received, otherwise "not joined". Reacts within 200 ms. Uses the modem's `VS_SNIFFER` indications (received beacons only); the sniffer runs from startup and is switched off while SLAC or IP traffic flows.
+
+## backlog_0007: serial diagnosis interface for the MMEs (done, 2026-09-15)
+
+**Status:** done + hardware-tested.
+
+Originated as `backlog-0047` in the qca7000-transparency repo, moved here 2026-09-15 (pure
+Arduino-side work, per the item-location split - see `backlog_0005`/`backlog_0006` above for the
+policy). The MainPC can no longer reach the QCA over Ethernet on this board (no JTAG, no
+Ethernet-to-QCA), so the transparency repo's `rd_mem.py`/`wr_mem.py`/`nw_info.py`/
+`pingpong_ctl.py status`/`mme_test_battery.py` have no path here.
+
+- `diag.h/.cpp` (this repo): a serial command interface - one command per line, one answer line
+  per command, tagged so a script can wait for it (`RD`/`WR`/`NWI`/`PP`/`STAT`/`QRESET`/`BCAST`/
+  `LOG`). Sends `VS_RD_MEM`/`VS_WR_MEM`/`CM_NW_INFO`/`GET_SW` over SPI on the ESP32's behalf.
+  `bcast 0` also silences the sketch's own periodic GET_SW/NW_INFO/sniffer broadcasts
+  (`backlog_0006`) for careful low-level testing.
+- `helpers/dave_serial.py` (qca7000-transparency repo, MainPC-side): drives the above from scripts
+  over the serial port - the pingpong status line (magic, armed, teiA/B, own-TEI, flips, data) was
+  the first user.
+- **DONE 2026-09-15:** both sides implemented and tested together.
+
 ## backlog_0002: cyclic software version polling with multiple modems
 
 **Status:** done and tested on the testbench (2026-09-14); only the check on the TFT is still open

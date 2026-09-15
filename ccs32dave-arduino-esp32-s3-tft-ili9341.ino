@@ -44,6 +44,25 @@
 #define QCA_REQUEST_INTERVAL_MS 5000   // GET_SW.REQ and CM_NW_INFO.REQ
 #define QCA_MAX_AGE_MS          (3 * QCA_REQUEST_INTERVAL_MS + 500)
 
+// backlog-0056: auto-toggle VS_SNIFFER so we can tell "no PLC CCo visible" apart from "beacons
+// seen but no SLAC/IP" - enable whenever idle, disable once real traffic is flowing again (the
+// .IND stream would otherwise spam the SPI link for no extra information). Deliberately the same
+// value as QCA_REQUEST_INTERVAL_MS: the toggle is driven from sendRequests(), so it needs no
+// timer of its own and self-heals (resent every cycle) if one REQ is dropped.
+#define SNIFFER_IDLE_MS         QCA_REQUEST_INTERVAL_MS
+// "beacons only" stays on until this long after the last received beacon. Owner requirement
+// 2026-09-15: at most 200 ms from beacon indication to TFT, both on and off. The AR7420 beacons
+// every 40 ms (largest gap seen 71 ms), so 150 ms bridges one lost beacon and leaves ~50 ms for
+// the loop.
+#define SNIFFER_BEACON_HOLD_MS 150
+// Beacon meter (owner request 2026-09-15): beacons received in the last ~200 ms, one segment each.
+// A CCo beacons every 40 ms, so 5 = every beacon arrived. Exactly 200 ms sits on the 4/5 edge and
+// flipped ~20x/s from our ~25 ms arrival jitter (bench); the extra 30 ms keeps an unbroken beacon
+// train at a steady 5, so a 4 means one really went missing.
+#define SNIFFER_METER_WINDOW_MS 230
+#define SNIFFER_METER_SEGMENTS 5
+#define PANEL_REFRESH_INTERVAL_MS 500  // re-evaluate time-based panel state (the value fade)
+
 #define SERIAL_BAUD 921600  // high rate, so logging every frame doesn't slow down the loop
 
 // Locally administered MAC used as source of our requests
@@ -78,6 +97,24 @@ struct TrafficStats {
   uint32_t other = 0;
 };
 TrafficStats traffic;
+
+// backlog-0056: VS_SNIFFER auto-toggle state + the idle timer that drives it.
+struct SnifferStatus {
+  bool enabled = false;
+  uint32_t indCount = 0;      // all VS_SNIFFER.IND (every delimiter, own transmissions included)
+  uint32_t beaconCount = 0;   // only received beacons (homeplug::isReceivedBeaconInd)
+  uint32_t lastBeaconMs = 0;  // 0 = none yet
+  bool beaconActive = false;  // a received beacon within SNIFFER_BEACON_HOLD_MS
+  uint32_t beaconTimes[8] = {};  // ring of the latest beacon arrival times, for the meter
+  uint8_t beaconTimesNext = 0;
+  uint8_t beaconLevel = 0;       // beacons in the last SNIFFER_METER_WINDOW_MS, capped
+  uint8_t levelMin = 255, levelMax = 0, levelChanges = 0;  // for the SNIF summary line
+};
+SnifferStatus sniffer;
+// Last SLAC-or-IP frame seen (NOT our own periodic GET_SW/NW_INFO polling, and NOT a
+// VS_SNIFFER.IND - see onHomeplugFrame()). 0 = none yet since boot, which correctly starts the
+// idle timer running from power-on.
+uint32_t lastRealTrafficMs = 0;
 
 bool panelDirty = true;
 
@@ -148,6 +185,48 @@ TextLine msgLine          = {PANEL_X, 199, 1, 16};  // last decoded message name
 TextLine rcLine           = {PANEL_X, 209, 1, 16};  // response code, only shown if not OK
 
 TextLine counterLine = {TEXT_X, 229, 1};
+
+// Delimiter metadata, not logged per frame (tens per second once enabled). Only RECEIVED beacons
+// count as "a CCo is in sight": the stream also reports the local modem's own transmissions, and
+// counting those kept the beacon display on after the AR7420 was switched off (owner report
+// 2026-09-15).
+void handleSnifferInd(const uint8_t *frame, uint16_t len) {
+  sniffer.indCount++;
+  if (homeplug::isReceivedBeaconInd(frame, len)) {
+    if (sniffer.beaconCount == 0) {
+      Serial.println("Sniffer: first received beacon");
+    }
+    sniffer.beaconCount++;
+    sniffer.lastBeaconMs = millis();
+    sniffer.beaconTimes[sniffer.beaconTimesNext] = sniffer.lastBeaconMs;
+    sniffer.beaconTimesNext = (sniffer.beaconTimesNext + 1) % 8;
+  }
+}
+
+// Beacon meter right of the "beacons" label on the network line (text size 2 -> 16 px high).
+static const int16_t METER_X = 222;
+static const int16_t METER_Y = 28;
+static const int16_t METER_SEG_W = 14;
+static const int16_t METER_SEG_H = 14;
+static const int16_t METER_GAP = 3;
+static const uint16_t COLOR_METER_EMPTY = 0x39E7;
+int8_t meterShown = -1;  // level currently on screen, -1 = meter not drawn
+
+void drawBeaconMeter(uint8_t level) {
+  if (meterShown < 0) {
+    // First draw after full-width text: clear what the short label's padding didn't cover
+    tft.fillRect(130 + 7 * 12, 27, tft.width() - (130 + 7 * 12), 16, ILI9341_BLACK);
+  }
+  for (uint8_t i = 0; i < SNIFFER_METER_SEGMENTS; i++) {
+    bool on = i < level;
+    if (meterShown >= 0 && on == (i < meterShown)) {
+      continue;  // only segments that changed
+    }
+    tft.fillRect(METER_X + i * (METER_SEG_W + METER_GAP), METER_Y, METER_SEG_W, METER_SEG_H,
+                 on ? ILI9341_ORANGE : COLOR_METER_EMPTY);
+  }
+  meterShown = level;
+}
 
 uint8_t lineColumns(const TextLine &line) {
   return line.cols ? line.cols : (tft.width() - line.x) / (6 * line.size);
@@ -291,7 +370,14 @@ static char splashLocalVersion[homeplug::VERSION_MAX_LEN + 1] = "";
 // the normal onHomeplugFrame()/addLog() pipeline (the frame-log canvas isn't meant to be
 // touched yet). Also seeds the modem table, so the main screen shows it immediately.
 static void splashHandleFrame(const uint8_t *frame, uint16_t len) {
-  if (splashLocalVersion[0] || homeplug::etherType(frame) != homeplug::ETHERTYPE_HOMEPLUG) {
+  if (homeplug::etherType(frame) != homeplug::ETHERTYPE_HOMEPLUG) {
+    return;
+  }
+  if (homeplug::mmtype(frame) == homeplug::MMTYPE_VS_SNIFFER_IND) {
+    handleSnifferInd(frame, len);  // beacons already count while the splash is shown
+    return;
+  }
+  if (splashLocalVersion[0]) {
     return;
   }
   homeplug::SoftwareVersion sw;
@@ -346,10 +432,16 @@ void showSplashScreen() {
 
     if (!requested && qca.readSignature() == Qca7000::SIGNATURE) {
       qca.sendEthFrame(frame, homeplug::composeGetSwReq(frame, MY_MAC));
+      // Sniffer on right away (backlog-0056): otherwise beacon detection only starts with the
+      // first sendRequests() after the splash. No traffic has been seen yet, so "idle" holds.
+      qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, true));
+      sniffer.enabled = true;
       requested = true;
     }
+    if (requested) {
+      qca.poll(splashHandleFrame);  // keep reading during the whole splash, the .INDs keep coming
+    }
     if (requested && !shown) {
-      qca.poll(splashHandleFrame);
       if (splashLocalVersion[0]) {
         char line[40];
         const char *v = splashLocalVersion;
@@ -408,10 +500,13 @@ void drawStaticScreen() {
 struct V2gDisplay {
   bool hasTarget = false;
   float targetVoltage = 0, targetCurrent = 0;      // from CurrentDemandReq (PEV -> EVSE)
+  uint32_t targetUpdatedMs = 0;                    // backlog-0055: for the stale-value fade
   bool hasPresent = false;
   float presentVoltage = 0, presentCurrent = 0;    // from CurrentDemandRes (EVSE -> PEV)
+  uint32_t presentUpdatedMs = 0;
   bool hasSoc = false;
   int8_t soc = 0;                                  // DC_EVStatus.EVRESSSOC, from the PEV
+  uint32_t socUpdatedMs = 0;
   bool hasResponseCode = false;
   uint8_t responseCode = 0;
   char lastMsg[28] = "";
@@ -424,18 +519,33 @@ V2gDisplay v2gDisplay;
 // persistent display state above. Prints to serial only when the shown VALUES actually
 // change (not on every message) - same convention as printModemTable() / the "Network:"
 // line elsewhere in this file, so the TFT's content can be checked without seeing the screen.
+//
+// backlog-0055: each of the three field groups (target V+A, present V+A, SoC) gets its own
+// "last updated" timestamp, refreshed whenever a message carries that group AT ALL - even if
+// the value repeated - because target/present/SoC arrive in different DIN messages at different
+// times and so go stale independently of each other.
 void applyV2gValues(const V2gValues &v, bool ok) {
   if (ok) {
     v2gDisplay.decoded++;
     bool changed = false;
-    if (v.hasTargetVoltage && v.targetVoltage != v2gDisplay.targetVoltage) { v2gDisplay.targetVoltage = v.targetVoltage; changed = true; }
-    if (v.hasTargetCurrent && v.targetCurrent != v2gDisplay.targetCurrent) { v2gDisplay.targetCurrent = v.targetCurrent; changed = true; }
-    if (v.hasTargetVoltage || v.hasTargetCurrent) v2gDisplay.hasTarget = true;
-    if (v.hasPresentVoltage && v.presentVoltage != v2gDisplay.presentVoltage) { v2gDisplay.presentVoltage = v.presentVoltage; changed = true; }
-    if (v.hasPresentCurrent && v.presentCurrent != v2gDisplay.presentCurrent) { v2gDisplay.presentCurrent = v.presentCurrent; changed = true; }
-    if (v.hasPresentVoltage || v.hasPresentCurrent) v2gDisplay.hasPresent = true;
-    if (v.hasSoc && v.soc != v2gDisplay.soc) { v2gDisplay.soc = v.soc; changed = true; }
-    if (v.hasSoc) v2gDisplay.hasSoc = true;
+    uint32_t now = millis();
+    if (v.hasTargetVoltage || v.hasTargetCurrent) {
+      if (v.hasTargetVoltage && v.targetVoltage != v2gDisplay.targetVoltage) { v2gDisplay.targetVoltage = v.targetVoltage; changed = true; }
+      if (v.hasTargetCurrent && v.targetCurrent != v2gDisplay.targetCurrent) { v2gDisplay.targetCurrent = v.targetCurrent; changed = true; }
+      v2gDisplay.hasTarget = true;
+      v2gDisplay.targetUpdatedMs = now;
+    }
+    if (v.hasPresentVoltage || v.hasPresentCurrent) {
+      if (v.hasPresentVoltage && v.presentVoltage != v2gDisplay.presentVoltage) { v2gDisplay.presentVoltage = v.presentVoltage; changed = true; }
+      if (v.hasPresentCurrent && v.presentCurrent != v2gDisplay.presentCurrent) { v2gDisplay.presentCurrent = v.presentCurrent; changed = true; }
+      v2gDisplay.hasPresent = true;
+      v2gDisplay.presentUpdatedMs = now;
+    }
+    if (v.hasSoc) {
+      if (v.soc != v2gDisplay.soc) { v2gDisplay.soc = v.soc; changed = true; }
+      v2gDisplay.hasSoc = true;
+      v2gDisplay.socUpdatedMs = now;
+    }
     if (v.hasResponseCode) { v2gDisplay.hasResponseCode = true; v2gDisplay.responseCode = v.responseCode; }
     if (changed) {
       Serial.printf("V2G: %s  Tgt %.1fV %.1fA  Pres %.1fV %.1fA  SoC %d%%\n", v.msgName,
@@ -450,6 +560,22 @@ void applyV2gValues(const V2gValues &v, bool ok) {
   panelDirty = true;
 }
 
+// backlog-0055: fades a V2G value's color as it goes stale - mid-gray after 2 s without a fresh
+// message for its field group, dark gray after 4 s. Only kicks in once a value has been seen at
+// all; the "-" placeholder shown before that keeps its normal (fresh) color.
+uint16_t staleColor(uint16_t freshColor, bool has, uint32_t updatedMs) {
+  if (!has) {
+    return freshColor;
+  }
+  uint32_t age = millis() - updatedMs;
+  static const uint32_t STALE_MID_MS = 2000;
+  static const uint32_t STALE_DARK_MS = 4000;
+  static const uint16_t COLOR_STALE_DARK = 0x39E7;  // darker than COLOR_DARKGREY (0x7BEF)
+  if (age >= STALE_DARK_MS) return COLOR_STALE_DARK;
+  if (age >= STALE_MID_MS) return COLOR_DARKGREY;
+  return freshColor;
+}
+
 void drawPanel() {
   char buf[65];
 
@@ -458,10 +584,27 @@ void drawPanel() {
 
   // Network join status from CM_NW_INFO.CNF of the local modem
   static const char *const ROLE[] = {"STA", "PCo", "CCo"};
+  // backlog-0056: "beacons" + meter shares the network line. The short label leaves room for the
+  // meter; every other text uses the full width again, and its padding erases the meter.
+  bool showMeter = modem.present && network.valid && network.info.numNetworks == 0 &&
+                   sniffer.beaconActive;
+  uint8_t networkCols = showMeter ? 7 : 0;
+  if (networkLine.cols != networkCols) {
+    networkLine.cols = networkCols;
+    networkLine.drawn = false;
+    meterShown = -1;
+  }
   if (!modem.present || !network.valid) {
     drawLine(networkLine, COLOR_DARKGREY, "Net ?");
   } else if (network.info.numNetworks == 0) {
-    drawLine(networkLine, ILI9341_YELLOW, "not joined");
+    // "beacons" = a CCo is RF-reachable (received beacons) but never talks to us. beaconActive and
+    // beaconLevel are updated on every loop() pass (updateBeaconActive()), not on the panel tick.
+    if (showMeter) {
+      drawLine(networkLine, ILI9341_ORANGE, "beacons");
+      drawBeaconMeter(sniffer.beaconLevel);
+    } else {
+      drawLine(networkLine, ILI9341_YELLOW, "not joined");
+    }
   } else {
     snprintf(buf, sizeof(buf), "joined %s TEI%u",
              network.info.role < 3 ? ROLE[network.info.role] : "?",
@@ -494,13 +637,13 @@ void drawPanel() {
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(targetVoltLine, ILI9341_YELLOW, buf);
+  drawLine(targetVoltLine, staleColor(ILI9341_YELLOW, v2gDisplay.hasTarget, v2gDisplay.targetUpdatedMs), buf);
   if (v2gDisplay.hasTarget) {
     snprintf(buf, sizeof(buf), "%.1fA", v2gDisplay.targetCurrent);
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(targetCurrLine, ILI9341_YELLOW, buf);
+  drawLine(targetCurrLine, staleColor(ILI9341_YELLOW, v2gDisplay.hasTarget, v2gDisplay.targetUpdatedMs), buf);
 
   drawLine(presentLabelLine, COLOR_DARKGREY, "PRESENT");
   if (v2gDisplay.hasPresent) {
@@ -508,13 +651,13 @@ void drawPanel() {
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(presentVoltLine, ILI9341_GREEN, buf);
+  drawLine(presentVoltLine, staleColor(ILI9341_GREEN, v2gDisplay.hasPresent, v2gDisplay.presentUpdatedMs), buf);
   if (v2gDisplay.hasPresent) {
     snprintf(buf, sizeof(buf), "%.1fA", v2gDisplay.presentCurrent);
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(presentCurrLine, ILI9341_GREEN, buf);
+  drawLine(presentCurrLine, staleColor(ILI9341_GREEN, v2gDisplay.hasPresent, v2gDisplay.presentUpdatedMs), buf);
 
   drawLine(socLabelLine, COLOR_DARKGREY, "SoC");
   if (v2gDisplay.hasSoc) {
@@ -522,7 +665,7 @@ void drawPanel() {
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(socValueLine, ILI9341_CYAN, buf);
+  drawLine(socValueLine, staleColor(ILI9341_CYAN, v2gDisplay.hasSoc, v2gDisplay.socUpdatedMs), buf);
 
   drawLine(msgLine, v2gDisplay.lastOk ? ILI9341_WHITE : ILI9341_RED, v2gDisplay.lastMsg);
 
@@ -588,6 +731,19 @@ void logFrame(const uint8_t *frame, uint16_t len, const char *description) {
 }
 
 void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
+  uint16_t mm = homeplug::mmtype(frame);
+  if ((mm & 0xFFFC) == 0xA034) {
+    // backlog-0056: the whole VS_SNIFFER family (REQ 0xA034, CNF 0xA035 - the ack for our own
+    // toggle - IND 0xA036) is deliberately NOT counted as real traffic below. Found the hard way
+    // on real hardware (2026-09-15): catching only the .IND wasn't enough - the .CNF answering
+    // OUR OWN request every 5 s cycle was itself enough to keep re-arming the idle timer every
+    // single cycle, so the sniffer could never see itself as idle and would never turn on at all.
+    if (mm == homeplug::MMTYPE_VS_SNIFFER_IND) {
+      handleSnifferInd(frame, len);
+    }
+    return;
+  }
+
   homeplug::SoftwareVersion sw;
   if (homeplug::parseGetSwCnf(frame, len, sw)) {
     if (modems.update(sw, millis())) {
@@ -625,8 +781,10 @@ void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
     return;
   }
 
-  // Other MMEs, e.g. SLAC between car and charger
+  // Other MMEs, e.g. SLAC between car and charger - counts as real traffic for the sniffer
+  // idle timer (backlog-0056), unlike the GET_SW/NW_INFO polling answers handled above.
   traffic.mme++;
+  lastRealTrafficMs = millis();
   char name[24];
   homeplug::describeMmtype(homeplug::mmtype(frame), name, sizeof(name));
   addLog(name, ILI9341_CYAN, &frame[6]);
@@ -645,6 +803,7 @@ void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
 // that's the ground truth used by the capture-ratio measurements (backlog-0048).
 void onIpv6Frame(const uint8_t *frame, uint16_t len) {
   traffic.ipv6++;
+  lastRealTrafficMs = millis();  // real traffic for the sniffer idle timer (backlog-0056)
   panelDirty = true;
 
   // Ethernet header 14 bytes, IPv6 header 40 bytes, then TCP/UDP ports
@@ -747,10 +906,55 @@ void checkModem() {
   }
 }
 
+// Called on every loop() pass, right after the SPI poll and before the panel is drawn, so a
+// change of "beacons only" reaches the TFT in the same pass (owner requirement: <= 200 ms).
+void updateBeaconActive() {
+  uint32_t t = millis();  // not loop()'s `now`: lastBeaconMs may have been set after it
+  bool active = sniffer.enabled && sniffer.beaconCount != 0 &&
+                t - sniffer.lastBeaconMs < SNIFFER_BEACON_HOLD_MS;
+  if (active != sniffer.beaconActive) {
+    sniffer.beaconActive = active;
+    panelDirty = true;
+    Serial.printf("Beacon: %s at %lu ms (last beacon %lu ms)\n", active ? "on" : "off",
+                  (unsigned long)t, (unsigned long)sniffer.lastBeaconMs);
+  }
+
+  uint8_t level = 0;
+  if (active) {
+    uint8_t stored = sniffer.beaconCount < 8 ? sniffer.beaconCount : 8;
+    for (uint8_t i = 0; i < stored; i++) {
+      if (t - sniffer.beaconTimes[i] < SNIFFER_METER_WINDOW_MS) level++;
+    }
+    if (level > SNIFFER_METER_SEGMENTS) level = SNIFFER_METER_SEGMENTS;
+    sniffer.levelMin = min(sniffer.levelMin, level);
+    sniffer.levelMax = max(sniffer.levelMax, level);
+  }
+  if (level != sniffer.beaconLevel) {
+    sniffer.beaconLevel = level;
+    if (sniffer.levelChanges < 255) sniffer.levelChanges++;
+    if (meterShown >= 0 && active) {
+      drawBeaconMeter(level);  // right away: a few filled rectangles, cheap
+    }
+  }
+}
+
 void sendRequests(uint32_t now) {
   uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
   qca.sendEthFrame(frame, homeplug::composeGetSwReq(frame, MY_MAC));
   qca.sendEthFrame(frame, homeplug::composeNwInfoReq(frame, MY_MAC));
+
+  // backlog-0056: re-assert the sniffer's desired state every cycle (not only on transition) -
+  // VS_SNIFFER.REQ has no retry/ack of its own, so this is what makes a dropped frame self-heal,
+  // the same way GET_SW/NW_INFO above are re-sent unconditionally rather than only once.
+  bool shouldEnableSniffer = now - lastRealTrafficMs >= SNIFFER_IDLE_MS;
+  qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, shouldEnableSniffer));
+  if (shouldEnableSniffer != sniffer.enabled) {
+    sniffer.enabled = shouldEnableSniffer;
+    Serial.printf("Sniffer: %s (idle %lu ms)\n", shouldEnableSniffer ? "enabled" : "disabled",
+                  (unsigned long)(now - lastRealTrafficMs));
+    addLog(shouldEnableSniffer ? "** sniffer on" : "** sniffer off", ILI9341_YELLOW);
+    panelDirty = true;
+  }
 
   // Forget modems and network info that stopped answering
   if (modems.expire(now, QCA_MAX_AGE_MS)) {
@@ -792,9 +996,41 @@ void loop() {
   static uint32_t lastPoll = 0;
   static uint32_t lastCheck = millis();
   static uint32_t lastRequest = 0;
+  static uint32_t lastPanelRefresh = 0;
   static uint64_t lastShown = UINT64_MAX;
 
   uint32_t now = millis();
+
+  // Time-based panel state (the backlog-0055 stale-value fade, the backlog-0056 beacon-
+  // freshness window) needs re-evaluating even when no new frame arrives to set panelDirty.
+  if (now - lastPanelRefresh >= PANEL_REFRESH_INTERVAL_MS) {
+    lastPanelRefresh = now;
+    panelDirty = true;
+  }
+
+  // Once per second, only while .INDs arrive and "log 1": how many were received beacons vs.
+  // everything else - so the beacon display can be checked against the serial log.
+  // loopmax = longest loop() pass in that second (the part of the beacon->TFT delay we control).
+  static uint32_t lastSnifSummary = 0, lastInd = 0, lastBeacons = 0, loopMax = 0, prevLoopStart = now;
+  loopMax = max(loopMax, now - prevLoopStart);
+  prevLoopStart = now;
+  if (now - lastSnifSummary >= 1000) {
+    lastSnifSummary = now;
+    uint32_t ind = sniffer.indCount - lastInd, beacons = sniffer.beaconCount - lastBeacons;
+    if (ind && diag.logTraffic()) {
+      Serial.printf("SNIF %lu ind=%lu beacons=%lu other=%lu loopmax=%lums meter=%u..%u changes=%u\n",
+                    (unsigned long)now, (unsigned long)ind, (unsigned long)beacons,
+                    (unsigned long)(ind - beacons), (unsigned long)loopMax,
+                    sniffer.levelMin == 255 ? 0 : sniffer.levelMin, sniffer.levelMax,
+                    sniffer.levelChanges);
+    }
+    lastInd = sniffer.indCount;
+    lastBeacons = sniffer.beaconCount;
+    loopMax = 0;
+    sniffer.levelMin = 255;
+    sniffer.levelMax = 0;
+    sniffer.levelChanges = 0;
+  }
 
   if (now - lastCheck >= QCA_CHECK_INTERVAL_MS) {
     lastCheck = now;
@@ -814,6 +1050,8 @@ void loop() {
     }
     diag.loop(now);
   }
+
+  updateBeaconActive();
 
   if (panelDirty) {
     panelDirty = false;

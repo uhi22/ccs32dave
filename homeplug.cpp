@@ -257,4 +257,24 @@ bool parseVsNwInfoCnf(const uint8_t *frame, uint16_t len, VsNetworkInfo &out) {
   return true;
 }
 
+static constexpr uint16_t MMTYPE_VS_SNIFFER = 0xA034;
+
+uint16_t composeVsSnifferReq(uint8_t *frame, const uint8_t sourceMac[6], bool enable) {
+  uint8_t ofs = composeVendorHeader(frame, MAC_BROADCAST, sourceMac, MMTYPE_VS_SNIFFER | MMTYPE_REQ);
+  frame[ofs] = enable ? 1 : 0;
+  return MIN_ETH_FRAME_LEN;
+}
+
+bool isReceivedBeaconInd(const uint8_t *frame, uint16_t len) {
+  static constexpr uint8_t OFS_DIRECTION = 0x15;
+  static constexpr uint8_t OFS_FRAME_CONTROL = 0x22;
+  static constexpr uint8_t DIRECTION_RX = 1;
+  static constexpr uint8_t DELIMITER_BEACON = 0;
+  return len >= OFS_FRAME_CONTROL + 16 && etherType(frame) == ETHERTYPE_HOMEPLUG &&
+         mmtype(frame) == MMTYPE_VS_SNIFFER_IND &&
+         memcmp(&frame[OFS_OUI], QUALCOMM_OUI, 3) == 0 &&
+         frame[OFS_DIRECTION] == DIRECTION_RX &&
+         (frame[OFS_FRAME_CONTROL] & 0x07) == DELIMITER_BEACON;
+}
+
 }  // namespace homeplug

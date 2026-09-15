@@ -49,6 +49,10 @@ public:
 private:
   // Size of the modem's SPI buffers (Linux driver: QCASPI_HW_BUF_LEN)
   static constexpr uint16_t HW_BUFFER_LEN = 3163;
+  // A full read buffer reports HW_BUFFER_LEN + 4 bytes available (Linux driver accepts up to
+  // QCASPI_HW_BUF_LEN + QCASPI_HW_PKT_LEN). Rejecting that as implausible never drains the buffer,
+  // so RX stays dead for good - seen with the VS_SNIFFER.IND stream (RDBUF_BYTE_AVA stuck at 0x0C5F).
+  static constexpr uint16_t RX_BUFFER_MAX = HW_BUFFER_LEN + 4;
 
   void writeRegister(uint8_t reg, uint16_t value);
   void select();
@@ -63,6 +67,6 @@ private:
   uint32_t _errors = 0;
   uint32_t _txRejected = 0;
 
-  uint8_t _rxBuffer[HW_BUFFER_LEN];
+  uint8_t _rxBuffer[RX_BUFFER_MAX];
   uint8_t _txBuffer[MAX_ETH_FRAME_LEN + 12];
 };

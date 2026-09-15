@@ -116,7 +116,7 @@ uint16_t Qca7000::poll(FrameHandler handler) {
   if (avail == 0) {
     return 0;
   }
-  if (avail > HW_BUFFER_LEN) {
+  if (avail > RX_BUFFER_MAX) {
     // Implausible value, e.g. modem not connected
     _errors++;
     return 0;

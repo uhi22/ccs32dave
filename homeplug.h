@@ -99,4 +99,27 @@ struct VsNetworkInfo {
 // VS_NW_INFO.CNF (0xA039)
 bool parseVsNwInfoCnf(const uint8_t *frame, uint16_t len, VsNetworkInfo &out);
 
+// VS_SNIFFER.REQ (0xA034) broadcast; 1-byte payload, enable=true starts the .IND stream
+// (0xA036), enable=false stops it. Stock vendor MME, no firmware patch needed - see
+// qca7000-transparency repo's helpers/vs_sniffer.py for how it was found/confirmed on the old
+// DUT. Returns the frame length.
+uint16_t composeVsSnifferReq(uint8_t *frame, const uint8_t sourceMac[6], bool enable);
+
+// MMTYPE of VS_SNIFFER.IND (0xA036): per-delimiter (beacon/SOF) metadata, no application
+// payload. Streams continuously (~30-48/s) whenever the MAC observes RF activity while
+// enabled - treat as a "beacon activity" heartbeat, not as a frame worth logging individually.
+constexpr uint16_t MMTYPE_VS_SNIFFER_IND = 0xA036;
+
+// True if frame is a VS_SNIFFER.IND for a beacon the local modem RECEIVED. The stream also
+// reports every other delimiter, including the local modem's own transmissions (our periodic
+// broadcasts), which must not count as "a CCo is in sight". Wire layout, read off real records
+// on the bench 2026-09-15:
+//   0x15      0 = own transmission, 1 = received (inferred: the 0 records were SOFs with STEI 0
+//             and DTEI 0xFF, i.e. broadcasts from an unassociated station - the local modem)
+//   0x16      system time, 8 bytes LE;  0x1E  beacon time, 4 bytes
+//   0x22      HomePlug AV frame control, 16 bytes; delimiter type = low 3 bits of the first
+//             byte (0 = beacon, 1 = SOF)
+//   0x32      beacon payload, starting with the 7-byte NID
+bool isReceivedBeaconInd(const uint8_t *frame, uint16_t len);
+
 }  // namespace homeplug

@@ -11,6 +11,8 @@
 - **Fully autonomous transparency:** the modem's own firmware (`PINGPONG-RELEASE-2`) now arms and
   maintains both-direction traffic forwarding by itself.
 - **New two-column screen:** a prominent V2G value panel next to the frame log, plus a splash screen at boot (project name, GitHub link, build date, local modem version).
+- **Beacon meter:** when not joined, shows whether a charger's modem (CCo) is in sight and how well its beacons are received.
+- **Stale values fade out:** V2G values that are no longer updated turn gray.
 
 ## Description
 
@@ -21,7 +23,7 @@ At boot, a **splash screen** shows for ~5 s: project name, GitHub link, build da
 The main screen shows:
 
 - The local modem's status (SPI signature)
-- Whether the local modem has joined a powerline network, with its TEI and role (HomePlug `CM_NW_INFO`)
+- Whether the local modem has joined a powerline network, with its TEI and role (HomePlug `CM_NW_INFO`). If not joined: `beacons` plus a 5-segment meter while a CCo's beacons are received, otherwise `not joined`
 - Up to 3 modems in the network with MAC and software version (HomePlug `GET_SW`). The local modem, whose MAC ends in `FF:FF:11`, is marked with `*`.
 - Below the modem panel, two columns: a **frame log** on the left (events, MME/message names, UDP) and a prominent **V2G value panel** on the right - big stacked numbers for target/present voltage and current, SoC, the last decoded message name and its response code
 - Traffic and SPI counters
@@ -199,6 +201,24 @@ arduino-cli lib install "Adafruit ILI9341" "Adafruit GFX Library"
 
 `arduino-cli config init` fails if a config file already exists, e.g. because the Arduino IDE created one. That's fine: continue with the next command. To get the tested version, use `esp32:esp32@3.0.2`.
 
+#### Already set up on the dev/bench PC (2026-09-15)
+
+Everything above is already installed on the Windows machine this project is normally worked on
+from (`C:\UwesTechnik\...`) - no need to (re-)install, just use these paths directly:
+
+- `arduino-cli.exe`: `C:\Users\uwemi\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`
+  (bundled with Arduino IDE 2.x, no separate `arduino-cli` install)
+- Board package: `esp32:esp32` 3.0.2, in the default `Arduino15` data dir (`arduino-cli core list` to confirm)
+- Libraries: **not** in the default `Documents\Arduino\libraries` - this account's Documents is
+  OneDrive-redirected, so they're under
+  `C:\Users\uwemi\OneDrive\Dokumente\Arduino\libraries\` (`Adafruit_GFX_Library` 1.12.6,
+  `Adafruit_BusIO` 1.17.4, `Adafruit_ILI9341` 1.6.3 - `arduino-cli lib list` to confirm/update)
+- Compile-check (no upload, no board needed - use this to verify a change before touching hardware):
+  ```sh
+  "C:\Users\uwemi\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" compile --fqbn esp32:esp32:esp32s3 "C:\UwesTechnik\ccs32dave-arduino-esp32-s3-tft-ili9341"
+  ```
+- The ESP32 is on **COM11** on this bench (fixed, not just the doc's placeholder value) - confirm with `arduino-cli board list` if it's been replugged.
+
 **3. Build and upload**
 
 Run these commands in the sketch folder `ccs32dave-arduino-esp32-s3-tft-ili9341`:
@@ -234,11 +254,12 @@ labels, and does the first modem check.
 | Interval | Task |
 |---|---|
 | 1 s | `checkModem()`: reads the signature register (`0xAA55` = modem present). If the modem disappears, the modem table and network status are cleared. When it comes back, the requests are sent immediately. |
-| 5 s | `sendRequests()`: sends a broadcast `GET_SW.REQ` and a broadcast `CM_NW_INFO.REQ`, unless `bcast 0` was sent on the serial port (`diag`). Modems and network info that didn't answer for 3 cycles (15.5 s) are removed. |
+| 5 s | `sendRequests()`: sends a broadcast `GET_SW.REQ`, a broadcast `CM_NW_INFO.REQ` and `VS_SNIFFER.REQ` (sniffer on if no SLAC or IP traffic for 5 s, otherwise off), unless `bcast 0` was sent on the serial port (`diag`). Modems and network info that didn't answer for 3 cycles (15.5 s) are removed. |
 | 10 ms | `qca.poll()`: if the modem reports received data (`RDBUF_BYTE_AVA`), reads it, splits it into Ethernet frames and passes each one to `onEthFrame()` (see below) |
 | per poll | `diag.loop()`: serial diagnosis commands (`rd`/`wr`/`nwi`/`pp`/`stat`/`qreset`/`bcast`/`log`) |
+| every pass | `updateBeaconActive()`: beacon label on/off and meter level; redraws right away on a change (max. 200 ms from beacon to screen) |
 | 50 ms | Uptime display |
-| on change | `drawPanel()`: redraws only the text lines whose content changed |
+| on change, and every 500 ms | `drawPanel()`: redraws only the text lines whose content or color changed (the 500 ms tick lets stale values fade) |
 | on change, max. every 200 ms | `drawLog()`: redraws the frame log |
 
 `onEthFrame()` first offers the frame to `diag` (answers to a pending serial command are consumed
@@ -246,6 +267,9 @@ there, not shown as traffic), then sorts the rest:
 
 - **`GET_SW.CNF`:** added to the modem table. Once the local modem has joined a network, every modem in it answers.
 - **`CM_NW_INFO.CNF`:** only the answer of the local modem sets the join status (number of networks > 0 means joined).
+- **`VS_SNIFFER` (`0xA034`-`0xA036`):** not logged and not counted as traffic. Of the `.IND`s, only
+  beacons the modem received count for the beacon display; the stream also reports the modem's own
+  transmissions.
 - **Other HomePlug MMEs:** counted and added to the frame log (e.g. `SLAC_MATCH.CNF`).
 - **IPv6 UDP:** counted, protocol and ports added to the frame log (e.g. `UDP 59230>15118` = SDP).
 - **IPv6 TCP:** payload handed to the V2GTP reassembler (`v2gtp`); a completed message goes to the
@@ -266,7 +290,7 @@ printed, independent of that setting (same convention: print on change, not on e
   a wedged QCA needs a real reset line pulse), and the framing `AA AA AA AA | length | 00 00 |
   frame | 55 55` for sending and receiving Ethernet frames. It counts TX/RX/rejected frames and
   errors.
-- **`homeplug`:** builds `GET_SW.REQ` (Qualcomm vendor MME `0xA000`, OUI `00:B0:52`) and `CM_NW_INFO.REQ` (`0x6038`, MMV 1), plus the vendor MMEs `VS_RD_MEM`/`VS_WR_MEM`/`VS_NW_INFO` (`0xA008`/`0xA004`/`0xA038`) used by `diag` to talk to a specially patched local modem over SPI instead of Ethernet. It parses the matching `.CNF`s, and turns MMTYPEs into readable names.
+- **`homeplug`:** builds `GET_SW.REQ` (Qualcomm vendor MME `0xA000`, OUI `00:B0:52`) and `CM_NW_INFO.REQ` (`0x6038`, MMV 1), plus the vendor MMEs `VS_RD_MEM`/`VS_WR_MEM`/`VS_NW_INFO` (`0xA008`/`0xA004`/`0xA038`) used by `diag` to talk to a specially patched local modem over SPI instead of Ethernet, and `VS_SNIFFER.REQ` (`0xA034`, stock firmware) with a check for received beacon indications. It parses the matching `.CNF`s, and turns MMTYPEs into readable names.
 - **`modem_list`:** table of up to 3 modems, keyed by MAC, with the local modem always first. Entries expire when a modem stops answering.
 - **`diag`:** serial command interface (see its own header for the command list) - the diagnosis
   channel for a modem that has no other host link (no JTAG, no Ethernet to the QCA on this board).
@@ -298,8 +322,13 @@ blocking - nothing else needs to run during it.
   (green = decoded OK, red = a decode error), and its response code (blank until known, `OK` in
   green, `RC <n>` in red for any fault code - see `dinresponseCodeType` in
   `src/exi/dinEXIDatatypes.h` for the full list). Values persist across messages (e.g.
-  `CurrentDemandRes` doesn't repeat the target values) until a newer message updates them. Each row
-  is its own `TextLine`, so only the ones that actually changed get redrawn.
+  `CurrentDemandRes` doesn't repeat the target values) until a newer message updates them. A value
+  not updated for 2 s turns mid-gray, after 4 s dark gray. Each row is its own `TextLine`, so only
+  the ones that actually changed get redrawn.
+- **Beacon meter:** when not joined, the network line shows `beacons` (orange) and 5 segments, one
+  per beacon received in the last ~200 ms (a CCo beacons every 40 ms, so 5 = all received). It goes
+  back to `not joined` 150 ms after the last beacon. The sniffer is switched on during the splash
+  screen already, so the meter works as soon as the main screen appears.
 - **Frame log:** a ring buffer of 14 entries, narrowed (not shortened) to make room for the panel:
   uptime in whole seconds, MME/message name (still the full 20 characters it always had), and the
   last **2** bytes of the source MAC (was 3 - the extra byte wasn't worth the width once the panel
