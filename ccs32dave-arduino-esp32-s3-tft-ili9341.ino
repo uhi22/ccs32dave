@@ -15,6 +15,9 @@
 #include "qca7000.h"
 #include "homeplug.h"
 #include "modem_list.h"
+#include "diag.h"
+#include "v2gtp.h"
+#include "v2g_exi.h"
 
 // ---- TFT pins (ESP32-S3 default FSPI pins) ----------------------------------
 #define TFT_MOSI 11
@@ -41,7 +44,7 @@
 #define QCA_REQUEST_INTERVAL_MS 5000   // GET_SW.REQ and CM_NW_INFO.REQ
 #define QCA_MAX_AGE_MS          (3 * QCA_REQUEST_INTERVAL_MS + 500)
 
-#define LOG_TRAFFIC 1  // print every received frame on the serial port
+#define SERIAL_BAUD 921600  // high rate, so logging every frame doesn't slow down the loop
 
 // Locally administered MAC used as source of our requests
 static const uint8_t MY_MAC[6] = {0xFE, 0xED, 0xBE, 0xEF, 0xAF, 0xFE};
@@ -50,6 +53,7 @@ Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
 SPIClass qcaSpi(HSPI);
 Qca7000 qca(qcaSpi, QCA_CS, QCA_SPI_FREQUENCY);
+Diag diag(qca, Serial, MY_MAC);
 
 struct ModemStatus {
   bool checked = false;  // signature read at least once
@@ -77,6 +81,13 @@ TrafficStats traffic;
 
 bool panelDirty = true;
 
+// V2G values decoded from the reassembled DIN EXI traffic (backlog-0050/0051; struct and
+// applyV2gValues() are defined further down, next to drawPanel() where they're used - kept
+// out of this section because a struct with default member initializers here confused
+// Arduino's automatic function-prototype generator into mis-placing the TextLine-using
+// prototypes below ahead of TextLine's own definition).
+V2gtpReassembler v2gtp;
+
 // ---- Layout (landscape 320x240) ---------------------------------------------
 static const uint16_t COLOR_DARKGREY = 0x7BEF;
 static const int16_t TEXT_X = 10;
@@ -89,12 +100,20 @@ static const int16_t UPTIME_X = 320 - 4 - 4 - UPTIME_W;
 static const int16_t UPTIME_Y = 7;
 GFXcanvas16 uptimeCanvas(UPTIME_W, UPTIME_H);
 
-// Frame log, drawn off-screen and sent as one bitmap
+// Below the modem panel, the screen splits into two columns: the frame log (left) and a
+// prominent V2G value panel (right) - owner request 2026-09-15, the log doesn't need the
+// screen's full width once it no longer carries the numeric V2G detail itself.
+static const int16_t COLUMNS_TOP_Y = 76;     // divider below the modem panel
+static const int16_t COLUMNS_BOTTOM_Y = 223;  // divider above the counter line
+static const int16_t PANEL_DIVIDER_X = 207;   // vertical divider between log and V2G panel
+static const int16_t PANEL_X = 213;
+
+// Frame log (left column), drawn off-screen and sent as one bitmap
 static const uint8_t LOG_LINES = 14;
 static const int16_t LOG_PITCH = 10;
 static const int16_t LOG_X = TEXT_X;
 static const int16_t LOG_Y = 80;
-static const int16_t LOG_W = 51 * 6;
+static const int16_t LOG_W = PANEL_DIVIDER_X - LOG_X - 4;
 static const int16_t LOG_H = LOG_LINES * LOG_PITCH;
 GFXcanvas16 logCanvas(LOG_W, LOG_H);
 
@@ -113,6 +132,21 @@ TextLine statusLine  = {TEXT_X, 27, 2, 9};
 TextLine networkLine = {130, 27, 2};
 TextLine modemLines[ModemList::MAX_MODEMS] = {
     {TEXT_X, 47, 1}, {TEXT_X, 57, 1}, {TEXT_X, 67, 1}};
+
+// V2G value panel (right column) - "big stacked numbers" per owner request 2026-09-15.
+// cols=16 for label/message rows (16*6=96px), cols=7 for the big value rows (7*12=84px);
+// both comfortably inside the panel's ~100px width, PANEL_X to the screen edge.
+TextLine targetLabelLine  = {PANEL_X, 80, 1, 16};   // "TARGET"
+TextLine targetVoltLine   = {PANEL_X, 89, 2, 7};    // "230.0V"
+TextLine targetCurrLine   = {PANEL_X, 106, 2, 7};   // "10.0A"
+TextLine presentLabelLine = {PANEL_X, 125, 1, 16};  // "PRESENT"
+TextLine presentVoltLine  = {PANEL_X, 134, 2, 7};
+TextLine presentCurrLine  = {PANEL_X, 151, 2, 7};
+TextLine socLabelLine     = {PANEL_X, 170, 1, 16};  // "SoC"
+TextLine socValueLine     = {PANEL_X, 179, 2, 7};   // "42%"
+TextLine msgLine          = {PANEL_X, 199, 1, 16};  // last decoded message name
+TextLine rcLine           = {PANEL_X, 209, 1, 16};  // response code, only shown if not OK
+
 TextLine counterLine = {TEXT_X, 229, 1};
 
 uint8_t lineColumns(const TextLine &line) {
@@ -199,24 +233,154 @@ void drawLog() {
   uint8_t oldest = (logNewest + LOG_LINES + 1 - logCount) % LOG_LINES;
   for (uint8_t i = 0; i < logCount; i++) {
     const LogEntry &e = logEntries[(oldest + i) % LOG_LINES];
-    char mac[9] = "";
+    // Narrower column (backlog-0055: the V2G panel took the space) - time drops to whole
+    // seconds and the MAC suffix to its last 2 bytes, so the message name field (the part
+    // worth keeping full-width) stays the same 20 characters it always was.
+    char mac[6] = "";
     if (e.hasMac) {
-      snprintf(mac, sizeof(mac), "%02X:%02X:%02X", e.mac[0], e.mac[1], e.mac[2]);
+      snprintf(mac, sizeof(mac), "%02X:%02X", e.mac[1], e.mac[2]);
     }
     char count[8] = "";
     if (e.count > 1) {
       snprintf(count, sizeof(count), " x%u", e.count);
     }
     char buf[64];
-    snprintf(buf, sizeof(buf), "%5lu.%02u %-20.20s %-8s%s",
-             (unsigned long)(e.centiseconds / 100), (unsigned)(e.centiseconds % 100),
-             e.text, mac, count);
+    snprintf(buf, sizeof(buf), "%5lu %-20.20s %-5s%s",
+             (unsigned long)(e.centiseconds / 100), e.text, mac, count);
     logCanvas.setTextColor(e.color);
     logCanvas.setCursor(0, i * LOG_PITCH);
     logCanvas.print(buf);
   }
 
   tft.drawRGBBitmap(LOG_X, LOG_Y, logCanvas.getBuffer(), LOG_W, LOG_H);
+}
+
+// ---- Splash screen ------------------------------------------------------------
+// Shown once at boot, for SPLASH_DURATION_MS, while the QCA comes up: project name, GitHub
+// link, build date/time, and - if it answers in time - the local modem's own software
+// version. Purely cosmetic (blocks setup(), nothing else needs to run during it).
+static const uint32_t SPLASH_DURATION_MS = 5000;
+static const char *const SPLASH_TITLE = "ccs32dave";
+static const char *const SPLASH_SUBTITLE = "CCS Sniffer for ISO 15118 / DIN 70121";
+static const char *const SPLASH_URL = "github.com/uhi22/ccs32dave";
+
+static int16_t splashCenterX(const char *text, uint8_t size) {
+  return (tft.width() - (int16_t)strlen(text) * 6 * size) / 2;
+}
+
+static void splashPrintCentered(int16_t y, uint8_t size, uint16_t color, const char *text) {
+  tft.setTextSize(size);
+  tft.setTextColor(color, ILI9341_BLACK);
+  tft.setCursor(splashCenterX(text, size), y);
+  tft.print(text);
+}
+
+// A small lightning bolt, toggled fully on/off to pulse (a bit of "charging" flavor).
+static void splashDrawBolt(int16_t x, int16_t y, bool on) {
+  uint16_t c = on ? ILI9341_YELLOW : ILI9341_BLACK;
+  tft.drawLine(x + 8, y, x, y + 14, c);
+  tft.drawLine(x + 1, y, x + 9, y, c);
+  tft.drawLine(x, y + 14, x + 7, y + 14, c);
+  tft.drawLine(x + 6, y + 15, x + 8, y + 15, c);
+  tft.drawLine(x + 7, y + 14, x, y + 30, c);
+}
+
+static char splashLocalVersion[homeplug::VERSION_MAX_LEN + 1] = "";
+
+// Used only during the splash: parses a GET_SW.CNF from the local modem directly, bypassing
+// the normal onHomeplugFrame()/addLog() pipeline (the frame-log canvas isn't meant to be
+// touched yet). Also seeds the modem table, so the main screen shows it immediately.
+static void splashHandleFrame(const uint8_t *frame, uint16_t len) {
+  if (splashLocalVersion[0] || homeplug::etherType(frame) != homeplug::ETHERTYPE_HOMEPLUG) {
+    return;
+  }
+  homeplug::SoftwareVersion sw;
+  if (homeplug::parseGetSwCnf(frame, len, sw) && ModemList::isLocal(sw.mac)) {
+    strlcpy(splashLocalVersion, sw.version, sizeof(splashLocalVersion));
+    modems.update(sw, millis());
+    Serial.printf("Local modem (splash): %s\n", sw.version);
+  }
+}
+
+void showSplashScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextWrap(false);
+  tft.drawRoundRect(6, 6, tft.width() - 12, tft.height() - 12, 8, COLOR_DARKGREY);
+
+  // Typewriter reveal of the title
+  char partial[16] = "";
+  size_t titleLen = strlen(SPLASH_TITLE);
+  for (size_t i = 0; i <= titleLen; i++) {
+    memcpy(partial, SPLASH_TITLE, i);
+    partial[i] = '\0';
+    tft.fillRect(0, 55, tft.width(), 27, ILI9341_BLACK);
+    splashPrintCentered(55, 3, ILI9341_YELLOW, partial);
+    delay(60);
+  }
+
+  splashPrintCentered(95, 1, ILI9341_GREEN, SPLASH_SUBTITLE);
+  splashPrintCentered(108, 1, ILI9341_CYAN, SPLASH_URL);
+
+  char buildInfo[40];
+  snprintf(buildInfo, sizeof(buildInfo), "Built %s %s", __DATE__, __TIME__);
+  splashPrintCentered(122, 1, COLOR_DARKGREY, buildInfo);
+
+  static const int16_t MODEM_LINE_Y = 150;
+  splashPrintCentered(MODEM_LINE_Y, 1, ILI9341_WHITE, "Local modem: detecting...");
+
+  static const int16_t BAR_X = 40, BAR_Y = 190, BAR_W = 240, BAR_H = 12;
+  tft.drawRect(BAR_X, BAR_Y, BAR_W, BAR_H, COLOR_DARKGREY);
+
+  qca.begin(QCA_SCLK, QCA_MISO, QCA_MOSI);  // start the modem link now, so it can answer in time
+
+  uint32_t t0 = millis();
+  bool requested = false;
+  bool shown = false;
+  uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
+  uint32_t lastPulse = 0;
+  bool boltOn = false;
+  int16_t lastFill = -1;
+
+  while (millis() - t0 < SPLASH_DURATION_MS) {
+    uint32_t elapsed = millis() - t0;
+
+    if (!requested && qca.readSignature() == Qca7000::SIGNATURE) {
+      qca.sendEthFrame(frame, homeplug::composeGetSwReq(frame, MY_MAC));
+      requested = true;
+    }
+    if (requested && !shown) {
+      qca.poll(splashHandleFrame);
+      if (splashLocalVersion[0]) {
+        char line[40];
+        const char *v = splashLocalVersion;
+        if (strncmp(v, "MAC-", 4) == 0) {
+          v += 4;  // saves space; all QCA versions start with it
+        }
+        snprintf(line, sizeof(line), "Local modem: %s", v);
+        tft.fillRect(0, MODEM_LINE_Y, tft.width(), 8, ILI9341_BLACK);
+        splashPrintCentered(MODEM_LINE_Y, 1, ILI9341_WHITE, line);
+        shown = true;
+      }
+    }
+
+    if (millis() - lastPulse >= 300) {
+      lastPulse = millis();
+      boltOn = !boltOn;
+      splashDrawBolt(20, 50, boltOn);
+      splashDrawBolt(tft.width() - 36, 50, boltOn);
+    }
+
+    int16_t fill = (int16_t)((uint32_t)(BAR_W - 2) * elapsed / SPLASH_DURATION_MS);
+    if (fill != lastFill) {
+      tft.fillRect(BAR_X + 1, BAR_Y + 1, fill, BAR_H - 2, ILI9341_GREEN);
+      lastFill = fill;
+    }
+
+    delay(20);
+  }
+  if (requested && !shown) {
+    qca.poll(splashHandleFrame);  // one last chance, in case the answer is just arriving
+  }
 }
 
 // ---- Screen -----------------------------------------------------------------
@@ -228,13 +392,62 @@ void drawStaticScreen() {
   tft.setCursor(6, 3);
   tft.setTextSize(2);
   tft.setTextColor(ILI9341_YELLOW);
-  tft.print("ESP32-S3 QCA7005");
+  tft.print("ccs32dave");
 
   tft.drawRect(UPTIME_X - 4, UPTIME_Y - 4, UPTIME_W + 8, UPTIME_H + 8, COLOR_DARKGREY);
 
   tft.drawFastHLine(0, HEADER_LINE_Y, tft.width(), COLOR_DARKGREY);
-  tft.drawFastHLine(0, LOG_Y - 4, tft.width(), COLOR_DARKGREY);
-  tft.drawFastHLine(0, LOG_Y + LOG_H + 3, tft.width(), COLOR_DARKGREY);
+  tft.drawFastHLine(0, COLUMNS_TOP_Y, tft.width(), COLOR_DARKGREY);
+  tft.drawFastHLine(0, COLUMNS_BOTTOM_Y, tft.width(), COLOR_DARKGREY);
+  tft.drawFastVLine(PANEL_DIVIDER_X, COLUMNS_TOP_Y, COLUMNS_BOTTOM_Y - COLUMNS_TOP_Y, COLOR_DARKGREY);
+}
+
+// V2G values decoded from the reassembled DIN EXI traffic (backlog-0050/0051). Persist across
+// messages - e.g. CurrentDemandRes doesn't repeat the target values, so the display keeps
+// showing the last one seen until a newer message updates it (or the modem disappears).
+struct V2gDisplay {
+  bool hasTarget = false;
+  float targetVoltage = 0, targetCurrent = 0;      // from CurrentDemandReq (PEV -> EVSE)
+  bool hasPresent = false;
+  float presentVoltage = 0, presentCurrent = 0;    // from CurrentDemandRes (EVSE -> PEV)
+  bool hasSoc = false;
+  int8_t soc = 0;                                  // DC_EVStatus.EVRESSSOC, from the PEV
+  bool hasResponseCode = false;
+  uint8_t responseCode = 0;
+  char lastMsg[28] = "";
+  bool lastOk = false;
+  uint32_t decoded = 0, failed = 0;                // counters for the status line
+};
+V2gDisplay v2gDisplay;
+
+// Applies one decode result (ok=false: v.msgName carries a short error tag instead) to the
+// persistent display state above. Prints to serial only when the shown VALUES actually
+// change (not on every message) - same convention as printModemTable() / the "Network:"
+// line elsewhere in this file, so the TFT's content can be checked without seeing the screen.
+void applyV2gValues(const V2gValues &v, bool ok) {
+  if (ok) {
+    v2gDisplay.decoded++;
+    bool changed = false;
+    if (v.hasTargetVoltage && v.targetVoltage != v2gDisplay.targetVoltage) { v2gDisplay.targetVoltage = v.targetVoltage; changed = true; }
+    if (v.hasTargetCurrent && v.targetCurrent != v2gDisplay.targetCurrent) { v2gDisplay.targetCurrent = v.targetCurrent; changed = true; }
+    if (v.hasTargetVoltage || v.hasTargetCurrent) v2gDisplay.hasTarget = true;
+    if (v.hasPresentVoltage && v.presentVoltage != v2gDisplay.presentVoltage) { v2gDisplay.presentVoltage = v.presentVoltage; changed = true; }
+    if (v.hasPresentCurrent && v.presentCurrent != v2gDisplay.presentCurrent) { v2gDisplay.presentCurrent = v.presentCurrent; changed = true; }
+    if (v.hasPresentVoltage || v.hasPresentCurrent) v2gDisplay.hasPresent = true;
+    if (v.hasSoc && v.soc != v2gDisplay.soc) { v2gDisplay.soc = v.soc; changed = true; }
+    if (v.hasSoc) v2gDisplay.hasSoc = true;
+    if (v.hasResponseCode) { v2gDisplay.hasResponseCode = true; v2gDisplay.responseCode = v.responseCode; }
+    if (changed) {
+      Serial.printf("V2G: %s  Tgt %.1fV %.1fA  Pres %.1fV %.1fA  SoC %d%%\n", v.msgName,
+                    v2gDisplay.targetVoltage, v2gDisplay.targetCurrent, v2gDisplay.presentVoltage,
+                    v2gDisplay.presentCurrent, v2gDisplay.soc);
+    }
+  } else {
+    v2gDisplay.failed++;
+  }
+  strlcpy(v2gDisplay.lastMsg, v.msgName, sizeof(v2gDisplay.lastMsg));
+  v2gDisplay.lastOk = ok;
+  panelDirty = true;
 }
 
 void drawPanel() {
@@ -274,6 +487,56 @@ void drawPanel() {
     drawLine(modemLines[i], local ? ILI9341_CYAN : ILI9341_WHITE, buf);
   }
 
+  // V2G value panel (backlog-0051; layout backlog-0055): big stacked numbers, right column.
+  drawLine(targetLabelLine, COLOR_DARKGREY, "TARGET");
+  if (v2gDisplay.hasTarget) {
+    snprintf(buf, sizeof(buf), "%.1fV", v2gDisplay.targetVoltage);
+  } else {
+    strlcpy(buf, "-", sizeof(buf));
+  }
+  drawLine(targetVoltLine, ILI9341_YELLOW, buf);
+  if (v2gDisplay.hasTarget) {
+    snprintf(buf, sizeof(buf), "%.1fA", v2gDisplay.targetCurrent);
+  } else {
+    strlcpy(buf, "-", sizeof(buf));
+  }
+  drawLine(targetCurrLine, ILI9341_YELLOW, buf);
+
+  drawLine(presentLabelLine, COLOR_DARKGREY, "PRESENT");
+  if (v2gDisplay.hasPresent) {
+    snprintf(buf, sizeof(buf), "%.1fV", v2gDisplay.presentVoltage);
+  } else {
+    strlcpy(buf, "-", sizeof(buf));
+  }
+  drawLine(presentVoltLine, ILI9341_GREEN, buf);
+  if (v2gDisplay.hasPresent) {
+    snprintf(buf, sizeof(buf), "%.1fA", v2gDisplay.presentCurrent);
+  } else {
+    strlcpy(buf, "-", sizeof(buf));
+  }
+  drawLine(presentCurrLine, ILI9341_GREEN, buf);
+
+  drawLine(socLabelLine, COLOR_DARKGREY, "SoC");
+  if (v2gDisplay.hasSoc) {
+    snprintf(buf, sizeof(buf), "%d%%", v2gDisplay.soc);
+  } else {
+    strlcpy(buf, "-", sizeof(buf));
+  }
+  drawLine(socValueLine, ILI9341_CYAN, buf);
+
+  drawLine(msgLine, v2gDisplay.lastOk ? ILI9341_WHITE : ILI9341_RED, v2gDisplay.lastMsg);
+
+  // Response code: blank until known, "OK" once a 0, "RC <n>" (red) for any fault code -
+  // see dinresponseCodeType in src/exi/dinEXIDatatypes.h for the full list.
+  if (!v2gDisplay.hasResponseCode) {
+    drawLine(rcLine, COLOR_DARKGREY, "");
+  } else if (v2gDisplay.responseCode == 0) {
+    drawLine(rcLine, ILI9341_GREEN, "OK");
+  } else {
+    snprintf(buf, sizeof(buf), "RC %u", v2gDisplay.responseCode);
+    drawLine(rcLine, ILI9341_RED, buf);
+  }
+
   snprintf(buf, sizeof(buf), "MME %lu IPv6 %lu  SPI TX %lu RX %lu err %lu %04X",
            (unsigned long)traffic.mme, (unsigned long)traffic.ipv6,
            (unsigned long)qca.txFrames(), (unsigned long)qca.rxFrames(),
@@ -309,6 +572,19 @@ void printModemTable() {
     Serial.printf("  %c %s %s\n", ModemList::isLocal(modems[i].mac) ? '*' : ' ',
                   mac, modems[i].version);
   }
+}
+
+// One machine-readable line per received frame (serial command "log 0|1"):
+//   F <ms> <src MAC> <dst MAC> <len> <description>
+void logFrame(const uint8_t *frame, uint16_t len, const char *description) {
+  if (!diag.logTraffic()) {
+    return;
+  }
+  const uint8_t *d = &frame[0];
+  const uint8_t *s = &frame[6];
+  Serial.printf("F %lu %02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x %u %s\n",
+                (unsigned long)millis(), s[0], s[1], s[2], s[3], s[4], s[5],
+                d[0], d[1], d[2], d[3], d[4], d[5], len, description);
 }
 
 void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
@@ -355,13 +631,18 @@ void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
   homeplug::describeMmtype(homeplug::mmtype(frame), name, sizeof(name));
   addLog(name, ILI9341_CYAN, &frame[6]);
   panelDirty = true;
-#if LOG_TRAFFIC
-  char src[18];
-  formatMac(src, sizeof(src), &frame[6]);
-  Serial.printf("RX %s from %s, %u bytes\n", name, src, len);
-#endif
+  char description[32];
+  snprintf(description, sizeof(description), "MME %s", name);
+  logFrame(frame, len, description);
 }
 
+// TCP payload segments are handed to the V2GTP reassembler (v2gtp.h, backlog-0050); a
+// completed V2GTP message is decoded (v2g_exi.h, backlog-0051) and applied to the display.
+// Only UDP frames and decoded/failed V2G messages get a TFT log line - individual TCP
+// segments (mostly bare ACKs, or the single data segment a small DIN message fits in) would
+// otherwise flood the 12-line ring buffer with little to show for it. Every counted IPv6
+// frame still gets its raw description on the serial port via logFrame(), unconditionally -
+// that's the ground truth used by the capture-ratio measurements (backlog-0048).
 void onIpv6Frame(const uint8_t *frame, uint16_t len) {
   traffic.ipv6++;
   panelDirty = true;
@@ -378,15 +659,55 @@ void onIpv6Frame(const uint8_t *frame, uint16_t len) {
   }
   char text[24];
   snprintf(text, sizeof(text), "%s %u>%u", proto, srcPort, dstPort);
-  addLog(text, ILI9341_GREEN, &frame[6]);
-#if LOG_TRAFFIC
-  Serial.printf("RX %s, %u bytes\n", text, len);
-#endif
+
+  // For TCP also flags, sequence number, payload length and the V2GTP length
+  // (if the payload starts with a V2GTP header 01 FE), e.g.
+  //   TCP 15118>49152 fl=18 seq=1a2b3c4d pl=43 v2g=35
+  char description[120];
+  strlcpy(description, text, sizeof(description));
+  uint16_t ipPayloadLen = len >= 14 + 40 ? (frame[18] << 8) | frame[19] : 0;
+
+  if (strcmp(proto, "TCP") == 0 && len >= 54 + 20 && 54u + ipPayloadLen <= len) {
+    uint32_t seq = ((uint32_t)frame[58] << 24) | (frame[59] << 16) | (frame[60] << 8) | frame[61];
+    uint8_t headerLen = (frame[66] >> 4) * 4;
+    uint8_t flags = frame[67];
+    int payloadLen = (int)ipPayloadLen - headerLen;
+    int v2gLen = -1;
+    const uint8_t *payload = &frame[54 + headerLen];
+    if (payloadLen >= 8 && payload[0] == 0x01 && payload[1] == 0xFE) {
+      v2gLen = (int)(((uint32_t)payload[4] << 24) | (payload[5] << 16) |
+                     (payload[6] << 8) | payload[7]);
+    }
+    snprintf(description, sizeof(description), "%s fl=%02x seq=%08lx pl=%d v2g=%d", text,
+             flags, (unsigned long)seq, payloadLen, v2gLen);
+
+    if (payloadLen > 0) {
+      const uint8_t *msg;
+      uint16_t msgLen;
+      if (v2gtp.feed(&frame[6], seq, payload, (uint16_t)payloadLen, &msg, &msgLen)) {
+        V2gValues v;
+        bool ok = decodeV2gExiPayload(msg + 8, (uint16_t)(msgLen - 8), v);  // skip V2GTP header
+        applyV2gValues(v, ok);
+        char logtext[30];
+        snprintf(logtext, sizeof(logtext), "%s%s", ok ? "" : "! ", v.msgName);
+        addLog(logtext, ok ? ILI9341_GREEN : ILI9341_RED, &frame[6]);
+        char extra[36];
+        snprintf(extra, sizeof(extra), " -> %s", v.msgName);
+        strlcat(description, extra, sizeof(description));
+      }
+    }
+  } else if (strcmp(proto, "UDP") == 0) {
+    addLog(text, ILI9341_GREEN, &frame[6]);
+  }
+  logFrame(frame, len, description);
 }
 
 void onEthFrame(const uint8_t *frame, uint16_t len) {
   if (len < 14) {
     return;
+  }
+  if (diag.onFrame(frame, len)) {
+    return;  // answer to a serial diagnosis command
   }
   switch (homeplug::etherType(frame)) {
     case homeplug::ETHERTYPE_HOMEPLUG:
@@ -397,6 +718,7 @@ void onEthFrame(const uint8_t *frame, uint16_t len) {
       break;
     default:
       traffic.other++;
+      logFrame(frame, len, "OTHER");
       break;
   }
 }
@@ -443,7 +765,9 @@ void sendRequests(uint32_t now) {
 // ---- Arduino entry points ---------------------------------------------------
 
 void setup() {
-  Serial.begin(115200);
+  Serial.setRxBufferSize(4096);  // "wr" command lines
+  Serial.setTxBufferSize(8192);  // bursts of frame log lines
+  Serial.begin(SERIAL_BAUD);
 
   if (TFT_BL >= 0) {
     pinMode(TFT_BL, OUTPUT);
@@ -453,13 +777,13 @@ void setup() {
   SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin(SPI_FREQUENCY);
   tft.setRotation(1);   // landscape, 320x240
+  showSplashScreen();   // also starts the QCA link (qca.begin()) - see there
   drawStaticScreen();
 
-  qca.begin(QCA_SCLK, QCA_MISO, QCA_MOSI);
   checkModem();
   drawPanel();
 
-  Serial.println("ESP32-S3 TFT + QCA7005 demo started");
+  Serial.println("ccs32dave started");
 }
 
 void loop() {
@@ -478,7 +802,8 @@ void loop() {
   }
 
   if (modem.present) {
-    if (modem.requestPending || now - lastRequest >= QCA_REQUEST_INTERVAL_MS) {
+    if (modem.requestPending ||
+        (diag.periodicRequests() && now - lastRequest >= QCA_REQUEST_INTERVAL_MS)) {
       modem.requestPending = false;
       lastRequest = now;
       sendRequests(now);
@@ -487,6 +812,7 @@ void loop() {
       lastPoll = now;
       qca.poll(onEthFrame);
     }
+    diag.loop(now);
   }
 
   if (panelDirty) {

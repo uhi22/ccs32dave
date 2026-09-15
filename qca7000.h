@@ -37,12 +37,19 @@ public:
   uint32_t txFrames() const { return _txFrames; }
   uint32_t rxFrames() const { return _rxFrames; }
   uint32_t errors() const { return _errors; }
+  uint32_t txRejected() const { return _txRejected; }  // no space in the write buffer
+
+  // Internal register, e.g. 0x02 WRBUF_SPC_AVA, 0x03 RDBUF_BYTE_AVA, 0x1A SIGNATURE
+  uint16_t readRegister(uint8_t reg, uint16_t *misoDuringCommand = nullptr);
+
+  // Restarts the modem over SPI (SLAVE_RESET bit in SPI_CONFIG, as the Linux
+  // qcaspi driver does). The modem boots again; the signature is invalid meanwhile.
+  void softReset();
 
 private:
   // Size of the modem's SPI buffers (Linux driver: QCASPI_HW_BUF_LEN)
   static constexpr uint16_t HW_BUFFER_LEN = 3163;
 
-  uint16_t readRegister(uint8_t reg, uint16_t *misoDuringCommand = nullptr);
   void writeRegister(uint8_t reg, uint16_t value);
   void select();
   void deselect();
@@ -54,6 +61,7 @@ private:
   uint32_t _txFrames = 0;
   uint32_t _rxFrames = 0;
   uint32_t _errors = 0;
+  uint32_t _txRejected = 0;
 
   uint8_t _rxBuffer[HW_BUFFER_LEN];
   uint8_t _txBuffer[MAX_ETH_FRAME_LEN + 12];

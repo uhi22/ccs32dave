@@ -67,6 +67,12 @@ void Qca7000::writeRegister(uint8_t reg, uint16_t value) {
   deselect();
 }
 
+void Qca7000::softReset() {
+  static constexpr uint8_t REG_SPI_CONFIG = 0x04;
+  static constexpr uint16_t SLAVE_RESET_BIT = 0x0040;
+  writeRegister(REG_SPI_CONFIG, readRegister(REG_SPI_CONFIG) | SLAVE_RESET_BIT);
+}
+
 uint16_t Qca7000::readSignature() {
   return readRegister(REG_SIGNATURE);
 }
@@ -79,6 +85,7 @@ bool Qca7000::sendEthFrame(const uint8_t *frame, uint16_t len) {
   uint16_t spiLen = len + FRAME_OVERHEAD;
   if (readRegister(REG_WRBUF_SPC_AVA) < spiLen) {
     _errors++;
+    _txRejected++;
     return false;
   }
   writeRegister(REG_BFR_SIZE, spiLen);

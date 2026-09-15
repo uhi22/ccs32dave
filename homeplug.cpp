@@ -139,4 +139,122 @@ bool parseNwInfoCnf(const uint8_t *frame, uint16_t len, NetworkInfo &out) {
   return true;
 }
 
+// ---- Qualcomm vendor MMEs for diagnosis ---------------------------------------
+
+static constexpr uint16_t MMTYPE_VS_WR_MEM = 0xA004;
+static constexpr uint16_t MMTYPE_VS_RD_MEM = 0xA008;
+static constexpr uint16_t MMTYPE_VS_NW_INFO = 0xA038;
+static constexpr uint8_t OFS_VS_PAYLOAD = 20;  // after the OUI
+
+static void putLe32(uint8_t *p, uint32_t v) {
+  p[0] = v & 0xFF;
+  p[1] = (v >> 8) & 0xFF;
+  p[2] = (v >> 16) & 0xFF;
+  p[3] = v >> 24;
+}
+
+static uint32_t getLe32(const uint8_t *p) {
+  return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Vendor MME header (MMV 0 + OUI) to dst; returns the payload offset
+static uint8_t composeVendorHeader(uint8_t *frame, const uint8_t dst[6],
+                                   const uint8_t src[6], uint16_t mm) {
+  composeHeader(frame, src, MMV_AV10, mm);
+  memcpy(&frame[0], dst, 6);
+  memcpy(&frame[OFS_OUI], QUALCOMM_OUI, 3);
+  return OFS_VS_PAYLOAD;
+}
+
+static bool isVendorCnf(const uint8_t *frame, uint16_t len, uint16_t mm, uint16_t minLen) {
+  return len >= minLen && etherType(frame) == ETHERTYPE_HOMEPLUG &&
+         mmtype(frame) == (mm | MMTYPE_CNF) &&
+         memcmp(&frame[OFS_OUI], QUALCOMM_OUI, 3) == 0;
+}
+
+uint16_t composeRdMemReq(uint8_t *frame, const uint8_t dst[6], const uint8_t src[6],
+                         uint32_t addr, uint32_t len) {
+  uint8_t ofs = composeVendorHeader(frame, dst, src, MMTYPE_VS_RD_MEM | MMTYPE_REQ);
+  putLe32(&frame[ofs], addr);
+  putLe32(&frame[ofs + 4], len);
+  return MIN_ETH_FRAME_LEN;
+}
+
+uint16_t composeWrMemReq(uint8_t *frame, const uint8_t dst[6], const uint8_t src[6],
+                         uint32_t addr, const uint8_t *data, uint16_t n) {
+  uint8_t ofs = composeVendorHeader(frame, dst, src, MMTYPE_VS_WR_MEM | MMTYPE_REQ);
+  putLe32(&frame[ofs], addr);
+  putLe32(&frame[ofs + 4], n);
+  memcpy(&frame[ofs + 8], data, n);
+  uint16_t len = ofs + 8 + n;
+  return len < MIN_ETH_FRAME_LEN ? MIN_ETH_FRAME_LEN : len;
+}
+
+bool parseRdMemCnf(const uint8_t *frame, uint16_t len, MemReadResult &out) {
+  // STATUS(1) addr(4) len(4) data
+  if (!isVendorCnf(frame, len, MMTYPE_VS_RD_MEM, OFS_VS_PAYLOAD + 9)) {
+    return false;
+  }
+  const uint8_t *p = &frame[OFS_VS_PAYLOAD];
+  memcpy(out.mac, &frame[6], 6);
+  out.status = p[0];
+  out.addr = getLe32(&p[1]);
+  out.len = getLe32(&p[5]);
+  out.data = &p[9];
+  if (out.status == 0 && OFS_VS_PAYLOAD + 9 + out.len > len) {
+    return false;
+  }
+  if (out.status != 0) {
+    out.len = 0;
+  }
+  return true;
+}
+
+bool parseWrMemCnf(const uint8_t *frame, uint16_t len, uint8_t mac[6], uint8_t &status) {
+  if (!isVendorCnf(frame, len, MMTYPE_VS_WR_MEM, OFS_VS_PAYLOAD + 1)) {
+    return false;
+  }
+  memcpy(mac, &frame[6], 6);
+  status = frame[OFS_VS_PAYLOAD];
+  return true;
+}
+
+uint16_t composeVsNwInfoReq(uint8_t *frame, const uint8_t dst[6], const uint8_t src[6]) {
+  composeVendorHeader(frame, dst, src, MMTYPE_VS_NW_INFO | MMTYPE_REQ);
+  return MIN_ETH_FRAME_LEN;
+}
+
+bool parseVsNwInfoCnf(const uint8_t *frame, uint16_t len, VsNetworkInfo &out) {
+  // NUMAVLNs at 0x14 (wire offset; the programmer's guide says 0x18), then
+  // NID(7) SNID TEI ROLE CCO_MAC(6) CCO_TEI NUMSTAS, then 15 bytes per station
+  if (!isVendorCnf(frame, len, MMTYPE_VS_NW_INFO, 0x15)) {
+    return false;
+  }
+  memset(&out, 0, sizeof(out));
+  memcpy(out.mac, &frame[6], 6);
+  out.numAvlns = frame[0x14];
+  if (out.numAvlns == 0) {
+    return true;
+  }
+  static constexpr uint16_t OFS_AVLN = 0x15;
+  if (OFS_AVLN + 18 > len) {
+    return false;
+  }
+  const uint8_t *a = &frame[OFS_AVLN];
+  out.ownTei = a[8];
+  out.role = a[9];
+  memcpy(out.ccoMac, &a[10], 6);
+  out.ccoTei = a[16];
+  uint8_t stations = a[17];
+  uint16_t pos = OFS_AVLN + 18;
+  for (uint8_t i = 0; i < stations && out.numStations < VsNetworkInfo::MAX_STATIONS &&
+                      pos + 15 <= len;
+       i++, pos += 15) {
+    memcpy(out.stations[out.numStations].mac, &frame[pos], 6);
+    out.stations[out.numStations].tei = frame[pos + 6];
+    out.numStations++;
+  }
+  return true;
+}
+
 }  // namespace homeplug

@@ -2,7 +2,13 @@
 
 ## backlog_0001: integrate QCA7005
 
-**Status:** in progress. Step 1 is done and tested with hardware (2026-09-14); step 2 is next.
+**Status:** Step 1 and Step 2 both done + hardware-tested (2026-09-14/15). The "no unicast" blocker
+is resolved (firmware `PINGPONG-RELEASE-2`) and DIN 70121 EXI decoding is live on real traffic.
+
+A serial diagnosis interface was added (`diag.h/.cpp`): the ESP32 sends the modem's Qualcomm vendor
+MMEs (VS_RD_MEM/VS_WR_MEM/VS_NW_INFO) over SPI and answers on the serial port, and prints one line
+per received frame (`F <ms> <src> <dst> <len> <desc>`, with TCP seq / payload-len / V2GTP-len). It's
+driven from a script on the host PC that talks to it over the serial port.
 
 ### Goal
 
@@ -34,24 +40,90 @@ Lessons learned:
 - **Modem powered?** Without supply, the signature read returned `0000`.
 - **Command word layout:** the register address is in bits 13..8 of the SPI command word (signature read = `0xDA00`, Linux: `SPI_REG_SIGNATURE 0x1A00`), not in the low byte. With the wrong layout, every register returns the same value. `Qca7000::dumpRegisters()` prints all registers to the serial port while the signature is wrong.
 
-### Step 2: passive DIN 70121 listener (to plan)
+### Step 2: passive DIN 70121 listener (done, 2026-09-15)
 
-Reference code in `C:\UwesTechnik\ccs32berta`:
+Reference code in `C:\UwesTechnik\ccs32berta` (`src/exi/`, OpenV2G-style EXI codec) was ported in:
+decoder-only files copied to `src/exi/` here (no encoder - only decoders are needed), compiled the
+same way ccs32berta does (Arduino compiles `.c`/`.cpp` in sketch subfolders; include with the
+`src/exi/...` relative path). `projectExiConnector.c` itself was **not** copied (it's mostly
+encoder-side plus a couple of globals this project doesn't need) - `v2g_exi.cpp` is a from-scratch,
+smaller glue layer instead (below). One trimmed-away piece had to be stubbed back in:
+`debugAddStringAndInt()`, a no-op debug hook the decoder calls internally.
 
-| File | What to take from it |
-|---|---|
-| `ipv6.ino` | IPv6/UDP/TCP parsing, V2GTP header (`01 FE`, payload type `0x8001` = EXI) |
-| `src/exi/` | EXI codec (OpenV2G style): app handshake (`appHand*`) and DIN (`din*`). Only the decoders are needed |
-| `src/exi/projectExiConnector.*` | Glue between the sketch and the EXI decoder |
-| `homeplug.ino` | MME constants, SLAC message layout (`CM_SLAC_MATCH`, `CM_SET_KEY`) |
+- **`v2gtp.h/.cpp`:** TCP reassembly + V2GTP framing, keyed by source MAC (no TCP stack - just
+  enough to find message boundaries). Tracks the expected sequence number per peer; a gap or
+  retransmit resets that peer's partial buffer and resyncs on the next `01 FE` header found in the
+  incoming bytes. In every session observed, one TCP segment carries exactly one V2GTP message, so
+  coalesced multi-message segments aren't handled (documented, not silently wrong).
+- **`v2g_exi.h/.cpp`:** decodes one complete EXI payload - DIN first (the common case once joined),
+  falling back to the app-handshake schema (`SupportedAppProtocolReq/Res`, used once per session
+  before DIN starts). Extracts message name (34 DIN body variants recognized) and, where present:
+  `EVTargetVoltage`/`EVTargetCurrent` (`CurrentDemandReq`), `EVSEPresentVoltage`/`EVSEPresentCurrent`
+  (`CurrentDemandRes`/`PreChargeRes`), `DC_EVStatus.EVRESSSOC` (SoC, several EV-sent messages),
+  `ResponseCode`. `dinEXIDocument` is ~28 KB (measured via host `sizeof`) - kept as a static global,
+  not on the stack.
+- **TFT:** two new lines between the modem panel and the frame log (`Tgt`/`Pres` V+A, SoC, last
+  message name); the frame log itself now shows decoded message names for TCP traffic (green =
+  decoded OK, red = decode error) instead of raw per-segment TCP lines, to avoid flooding the
+  12-line ring buffer (shrunk from 14 to make room). Every counted IPv6 frame still gets its raw
+  description on the serial port unconditionally (`logFrame()`), independent of what's shown.
+- **Validated offline first** (validate before trusting hardware), against a real captured DIN
+  session (`pingpong_session_20260913.pcap`, from a private bench-tooling project used to develop
+  and test this board's QCA firmware): a host-gcc build of the same decoder reproduced the EVSE's
+  own logged values exactly (`EVTargetVoltage 230.0`/`EVTargetCurrent 10.0`). A separate host unit
+  test of `V2gtpReassembler` (split segments, duplicates, gaps+resync, junk bytes) caught and fixed
+  two real bugs in `resyncBuffer()`'s return value before ever touching hardware. Both test
+  harnesses live in that other project, not in this repo.
+- **Live on real hardware, 2026-09-15:** a full EVSE session decoded 785 DIN messages with **0
+  decode errors** (`PowerDeliveryReq/Res`, `PreChargeReq/Res`, `CurrentDemandReq/Res` × ~389 each),
+  values matching pyPLC's own log (`230.0 V / 10.0 A`). Uses the autonomous ping-pong firmware
+  `PINGPONG-RELEASE-2` - no MainPC helper needed for either the traffic or the decode.
+- **Not yet done:** ISO 15118-2 (only DIN 70121 + the app handshake are decoded; out of scope for
+  now per the 2026-09-15 decision). SoC has read 0% in every session so far - the Foccci PEV
+  simulator likely doesn't report a real battery SoC; not a decoder bug (the field decodes fine,
+  see the offline validation values above).
 
-Open questions and ideas:
+Reference code and open earlier questions (kept for the record): `ipv6.ino` (IPv6/UDP/TCP parsing,
+V2GTP header) and `homeplug.ino` (MME constants, SLAC layout) from ccs32berta informed the design
+but weren't ported directly - this project's own `homeplug.h/.cpp` already covers the needed MMEs.
 
-- **Joining the car's and charger's network (decided):** the QCA7005 gets a special firmware that sniffs the key and joins the network by itself. Nothing to do in this project; the ESP32 just receives the traffic the modem forwards.
-- **Unicast traffic is not forwarded (observed 2026-09-14, firmware `PINGPONG-RELEASE-1`):** over two charging sessions on the testbench, the local modem forwarded SLAC (broadcast), `SET_KEY.REQ` and the **SDP request** (UDP multicast to port 15118). It forwarded **no SDP response and no TCP**, i.e. no unicast frames between the PEV and the EVSE. Without them, no DIN messages can be decoded. **This needs a change in the special firmware** (forward all frames to the host). Step 2 is blocked until then.
-- **TCP:** as a passive listener, no TCP stack is needed. Parse IPv6 → TCP → V2GTP and decode the payload, but handle TCP segments that are split or repeated.
-- **Display:** a message log (last N messages: direction, name, response code) and/or key values (EVSE voltage/current, SoC, target values).
-- **Memory:** the DIN decoder structures are large. Check RAM usage on the ESP32-S3; decode into a static document instead of the stack.
+- **Unicast traffic is not forwarded (observed 2026-09-14, firmware `PINGPONG-RELEASE-1`):** over two charging sessions on the testbench, the local modem forwarded SLAC (broadcast), `SET_KEY.REQ` and the **SDP request** (UDP multicast to port 15118). It forwarded **no SDP response and no TCP**, i.e. no unicast frames between the PEV and the EVSE. Without them, no DIN messages can be decoded.
+  - **RESOLVED 2026-09-15:** the special firmware could always forward both directions (per-frame own-TEI "ping-pong"), but `PINGPONG-RELEASE-1` needed a helper on the host PC to arm it, and boots with an **uninitialized** control block otherwise - so on ccs32dave it was never armed. The new firmware **`PINGPONG-RELEASE-2`** (magic `0x5AC1AC05`) arms and maintains itself with no host. Flashed and confirmed: both TCP directions reach the ESP32, balanced (~561 PEV + ~560 EVSE data segments in 40 s).
+
+## backlog_0003: splash screen (done, 2026-09-15)
+
+**Status:** done + hardware-tested.
+
+Owner request: TFT headline changed from "ESP32-S3 QCA7005" to "ccs32dave"; a welcome screen at
+boot for ~5 s (project name, GitHub link, build date/time, and - if it answers in time - the local
+modem's own software version), with an animation, before switching to the main screen.
+
+- `showSplashScreen()`, called from `setup()` right after the TFT starts (also starts the QCA link
+  early - `qca.begin()` - so the modem has the full 5 s to answer). Blocking (nothing else needs to
+  run during it).
+- Typewriter reveal of the title (size-3 "ccs32dave"), subtitle, GitHub link
+  (`github.com/uhi22/ccs32dave`), `Built <__DATE__> <__TIME__>`, a bordered progress bar filling
+  over the 5 s, and two pulsing lightning-bolt icons either side of the title.
+- Sends one `GET_SW.REQ` as soon as the modem's signature reads OK, and polls for the local
+  modem's own `GET_SW.CNF` (MAC ending `FF:FF:11`) for the rest of the splash window; if it
+  arrives, "Local modem: detecting..." is replaced with the real version and the modem table is
+  seeded so the main screen shows it immediately, no extra wait.
+- Confirmed live: local modem version (`PINGPONG-RELEASE-2`) captured and shown ~5.0 s after boot,
+  matching `SPLASH_DURATION_MS`.
+
+## backlog_0004: two-column layout - prominent V2G value panel (done, 2026-09-15)
+
+**Status:** done + hardware-tested.
+
+Owner request/decision: the target/present values needed much more prominence than the two shared
+text lines from backlog_0001 step 2 gave them. Since the log doesn't need the screen's full width,
+the screen below the modem panel now splits into two columns instead: the frame log (left, kept at
+its original 14 lines and full 20-character message-name field, but narrower - a 5-char whole-
+second timestamp and a 2-byte MAC suffix instead of the previous 8-char/3-byte ones) and a "big
+stacked numbers" V2G panel (right): `TARGET`/`PRESENT` voltage+current in size-2 text, `SoC`, the
+last decoded message name, and its response code (owner decision: show everything, not just V+A).
+A vertical divider separates the two columns. Confirmed live against a real EVSE session: all panel
+fields update correctly frame by frame.
 
 ## backlog_0002: cyclic software version polling with multiple modems
 
