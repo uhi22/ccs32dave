@@ -6,6 +6,8 @@
 
 ## News
 
+- **Works in a real-world charging session:** sniffing tested successfully on a Hyundai Ioniq
+  charging at an Alpitronic HYC300. See the [video on YouTube](https://www.youtube.com/watch?v=CvkjcjtfIfo).
 - **Live DIN 70121 decode**, both directions: target/present voltage and
   current, SoC and the last message name and response code, updating in real time on the TFT.
 - **Fully autonomous transparency:** the modem's own firmware (`PINGPONG-RELEASE-2`) now arms and
@@ -338,3 +340,10 @@ blocking - nothing else needs to run during it.
   log is rendered into a `GFXcanvas16` sized to the narrowed column and sent as one bitmap, at most
   every 200 ms.
 - **Uptime:** read from `esp_timer_get_time()`, which is 64-bit microseconds, so it doesn't overflow after 49 days like `millis()`. The fixed-width string `%8llu.%02us` is rendered into a 72×8 canvas and sent in one `drawRGBBitmap()` call. This avoids flicker.
+
+## References
+
+- [Ref1] Discussion of this project on the openinverter forum: https://openinverter.org/forum/viewtopic.php?t=7346
+- [Ref2] YouTube  video of a real-world charging session (Hyundai Ioniq at Alpitronic HYC300): https://www.youtube.com/watch?v=CvkjcjtfIfo
+- [Ref3] Prior work, pyPLC, the open source CCS communication solution: https://github.com/uhi22/pyPLC
+- [Ref4] The openinverter forum thread where all the CCS open source work started: https://openinverter.org/forum/viewtopic.php?t=2262
