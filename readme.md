@@ -10,11 +10,13 @@
   charging at an Alpitronic HYC300. See the [video on YouTube](https://www.youtube.com/watch?v=CvkjcjtfIfo).
 - **Live DIN 70121 decode**, both directions: target/present voltage and
   current, SoC and the last message name and response code, updating in real time on the TFT.
-- **Fully autonomous transparency:** the modem's own firmware (`PINGPONG-RELEASE-2`) now arms and
-  maintains both-direction traffic forwarding by itself.
+- **Fully autonomous transparency:** the modem's own firmware (`PINGPONG-RELEASE-5`) now arms and
+  maintains both-direction traffic forwarding by itself, and switches sides on the SDP messages so
+  a session start is captured completely (request *and* response).
 - **New two-column screen:** a prominent V2G value panel next to the frame log, plus a splash screen at boot (project name, GitHub link, build date, local modem version).
 - **Beacon meter:** when not joined, shows whether a charger's modem (CCo) is in sight and how well its beacons are received.
 - **Stale values fade out:** V2G values that are no longer updated turn gray.
+- **Page 2 (push button):** SDP transport security (TLS or not) and the XML schemas offered by the car and selected by the charger. A red `TLS` in the header warns that the session is encrypted.
 
 ## Description
 
@@ -25,18 +27,24 @@ At boot, a **splash screen** shows for ~5 s: project name, GitHub link, build da
 The main screen shows:
 
 - The local modem's status (SPI signature)
-- Whether the local modem has joined a powerline network, with its TEI and role (HomePlug `CM_NW_INFO`). If not joined: `beacons` plus a 5-segment meter while a CCo's beacons are received, otherwise `not joined`
+- Whether the local modem has joined a powerline network, with its role (vendor `VS_NW_INFO`, polled every second). If not joined: `beacons` plus a 5-segment meter while a CCo's beacons are received, otherwise `not joined`. The modem's own TEI is not shown, because the special firmware rewrites it for every frame
 - Up to 3 modems in the network with MAC and software version (HomePlug `GET_SW`). The local modem, whose MAC ends in `FF:FF:11`, is marked with `*`.
 - Below the modem panel, two columns: a **frame log** on the left (events, MME/message names, UDP) and a prominent **V2G value panel** on the right - big stacked numbers for target/present voltage and current, SoC, the last decoded message name and its response code
 - Traffic and SPI counters
-- In the header: the uptime in seconds with **10 ms resolution**, refreshed every **50 ms** (20 Hz)
+- In the header: the uptime in seconds with **10 ms resolution**, refreshed every **50 ms** (20 Hz), and a red `TLS` once the charger's SDP response selected TLS (orange `TLS?` if only the car's request asked for it)
+
+A push button (see "Page button" below) switches to **page 2**, and back:
+
+- **SDP:** what the car requests (TLS / no TLS, TCP / UDP), what the charger answers (the same, plus its IPv6 address and TCP port). Green = no TLS, red = TLS.
+- **App handshake:** up to 5 schemas offered by the car (SchemaID, priority, version, namespace such as `urn:din:70121:2012:MsgDef`), the charger's response code and selected schema, marked with `>` and shown in large text (e.g. `-> DIN 70121`).
+- The page stays coloured while the session is alive (any SDP or V2G message) and grays as a whole after 3 s without traffic. A SLAC match clears it, so values of the previous session can't reappear as current.
 
 ```
 +-------------------------------------------------------+
 | ccs32dave       (yellow, size 2)       [    1234.56s] |
 |---------------------------------------------------------
 | Modem OK (green/red)     joined STA TEI2  (size 2)     |
-| *04:65:65:FF:FF:11 PINGPONG-RELEASE-2         (cyan)   |
+| *04:65:65:FF:FF:11 PINGPONG-RELEASE-5         (cyan)   |
 |  98:48:27:5A:3C:E4 QCA7420-1.4.0.20-00-20171027-CS     |
 |  04:65:65:FF:FF:FF QCA7005-1.1.0.730-04-20140815-CS    |
 |------------------------------------|------------------|
@@ -65,9 +73,9 @@ backlog.md                                   planned work
 doc/                                         photos
 qca-modem-firmware/                          the QCA7005's own firmware images, flashed via
                                               flashrom from the SPI-connected host - current:
-                                              dut_flash_PINGPONG-RELEASE-2.bin (self-arming
-                                              both-direction transparency); RELEASE-1 kept
-                                              for reference, superseded
+                                              dut_flash_PINGPONG-RELEASE-5.bin (self-arming
+                                              both-direction transparency + complete SDP);
+                                              older releases kept for reference, superseded
 ccs32dave-arduino-esp32-s3-tft-ili9341.ino   Arduino sketch: display, splash screen, scheduling
 qca7000.h/.cpp                               QCA7000/QCA7005 SPI driver
 homeplug.h/.cpp                              HomePlug messages (GET_SW, NW_INFO, MME names,
@@ -130,9 +138,18 @@ The chosen GPIOs are free on every ESP32-S3 module variant. The wiring avoids GP
 | SPI_CS      | GPIO 15      | `QCA_CS`      | Active low                     |
 | INT         | –            |               | Not connected; the sketch polls |
 
+### Page button
+
+| Button | ESP32-S3 pin | Sketch define | Notes |
+|--------|--------------|---------------|-------|
+| one side | GPIO 16 | `PAGE_BUTTON_PIN` | Internal pull-up; a press toggles main page / page 2 (30 ms debounce) |
+| other side | GND | | |
+
+GPIO 16 is free on every ESP32-S3 module variant (it is only a 32 kHz crystal pin if such a crystal is fitted, which the DevKitC-1 doesn't have). The BOOT button isn't used because it's hard to reach.
+
 #### QCA7005 notes
 
-- **SPI settings:** mode 3 (clock idle high) at 2 MHz, as in ccs32berta.
+- **SPI settings:** mode 3 (clock idle high) at 4 MHz. ccs32berta used 2 MHz; 4 MHz gives headroom for the sniffer stream and measured no SPI errors, while 8 MHz did (`QCA_SPI_FREQUENCY`).
 - **Supply:** check the modem board's supply voltage before connecting. The SPI lines must be 3.3 V logic.
 - **No interrupt:** the sketch polls the modem's receive buffer every 10 ms instead of using INT.
 - **Diagnosis:** if the display shows `Modem: missing`, the signature read didn't return `AA55`. `FFFF` or `0000` usually means a wiring problem (MISO, CS, CLK) or no supply. While the signature is wrong, the serial port prints all internal registers every second (`QCA regs: ...`). If they all have the same value, the modem isn't decoding the commands.
@@ -256,13 +273,15 @@ labels, and does the first modem check.
 | Interval | Task |
 |---|---|
 | 1 s | `checkModem()`: reads the signature register (`0xAA55` = modem present). If the modem disappears, the modem table and network status are cleared. When it comes back, the requests are sent immediately. |
-| 5 s | `sendRequests()`: sends a broadcast `GET_SW.REQ`, a broadcast `CM_NW_INFO.REQ` and `VS_SNIFFER.REQ` (sniffer on if no SLAC or IP traffic for 5 s, otherwise off), unless `bcast 0` was sent on the serial port (`diag`). Modems and network info that didn't answer for 3 cycles (15.5 s) are removed. |
+| 5 s | `sendRequests()`: broadcast `GET_SW.REQ` for the modem list; modems that didn't answer for 3 cycles (15.5 s) are removed |
+| 1 s | `sendStatusRequests()`: `VS_NW_INFO.REQ` to the local modem only (not onto the powerline) for the join status, then `VS_SNIFFER.REQ` with the wanted sniffer state. Both stop after `bcast 0` on the serial port (`diag`) |
 | 10 ms | `qca.poll()`: if the modem reports received data (`RDBUF_BYTE_AVA`), reads it, splits it into Ethernet frames and passes each one to `onEthFrame()` (see below) |
 | per poll | `diag.loop()`: serial diagnosis commands (`rd`/`wr`/`nwi`/`pp`/`stat`/`qreset`/`bcast`/`log`) |
 | every pass | `updateBeaconActive()`: beacon label on/off and meter level; redraws right away on a change (max. 200 ms from beacon to screen) |
+| every pass | `pollPageButton()`: on a debounced press, `showPage()` clears everything below the header and redraws the other page |
 | 50 ms | Uptime display |
-| on change, and every 500 ms | `drawPanel()`: redraws only the text lines whose content or color changed (the 500 ms tick lets stale values fade) |
-| on change, max. every 200 ms | `drawLog()`: redraws the frame log |
+| on change, and every 500 ms | `drawHeaderHint()` (`TLS`), then `drawPanel()` (main page) or `drawPage2()`: redraws only the text lines whose content or color changed (the 500 ms tick lets stale values fade) |
+| on change, max. every 200 ms | `drawLog()`: redraws the frame log (main page only; entries are still collected on page 2) |
 
 `onEthFrame()` first offers the frame to `diag` (answers to a pending serial command are consumed
 there, not shown as traffic), then sorts the rest:
@@ -273,10 +292,11 @@ there, not shown as traffic), then sorts the rest:
   beacons the modem received count for the beacon display; the stream also reports the modem's own
   transmissions.
 - **Other HomePlug MMEs:** counted and added to the frame log (e.g. `SLAC_MATCH.CNF`).
-- **IPv6 UDP:** counted, protocol and ports added to the frame log (e.g. `UDP 59230>15118` = SDP).
+- **IPv6 UDP:** counted. SDP request/response (V2GTP payload type `0x9000`/`0x9001`) is decoded for
+  page 2 and logged as e.g. `SDP req no TLS TCP`; other UDP frames are logged with protocol and ports.
 - **IPv6 TCP:** payload handed to the V2GTP reassembler (`v2gtp`); a completed message goes to the
   EXI decoder (`v2g_exi`) and the result (message name, and any of target/present V+A, SoC, response
-  code it carries) updates the TFT. Individual TCP segments (mostly bare ACKs) are not logged on the
+  code it carries, or the offered/selected schemas of the app handshake) updates the TFT. Individual TCP segments (mostly bare ACKs) are not logged on the
   TFT - only UDP frames and decoded/failed V2G messages are, to keep the 12-line ring buffer useful.
 
 Every counted frame's raw description is printed on the serial port unconditionally via
@@ -294,7 +314,7 @@ printed, independent of that setting (same convention: print on change, not on e
   errors.
 - **`homeplug`:** builds `GET_SW.REQ` (Qualcomm vendor MME `0xA000`, OUI `00:B0:52`) and `CM_NW_INFO.REQ` (`0x6038`, MMV 1), plus the vendor MMEs `VS_RD_MEM`/`VS_WR_MEM`/`VS_NW_INFO` (`0xA008`/`0xA004`/`0xA038`) used by `diag` to talk to a specially patched local modem over SPI instead of Ethernet, and `VS_SNIFFER.REQ` (`0xA034`, stock firmware) with a check for received beacon indications. It parses the matching `.CNF`s, and turns MMTYPEs into readable names.
 - **`modem_list`:** table of up to 3 modems, keyed by MAC, with the local modem always first. Entries expire when a modem stops answering.
-- **`diag`:** serial command interface (see its own header for the command list) - the diagnosis
+- **`diag`:** serial command interface, including `sniff on|auto` (see its own header for the full list) - the diagnosis
   channel for a modem that has no other host link (no JTAG, no Ethernet to the QCA on this board).
 - **`v2gtp`:** TCP reassembly + V2GTP message framing, keyed by source MAC, without a TCP stack.
 - **`v2g_exi`:** decodes one complete EXI payload (DIN 70121, or the app-handshake) using the ported
@@ -331,6 +351,11 @@ blocking - nothing else needs to run during it.
   per beacon received in the last ~200 ms (a CCo beacons every 40 ms, so 5 = all received). It goes
   back to `not joined` 150 ms after the last beacon. The sniffer is switched on during the splash
   screen already, so the meter works as soon as the main screen appears.
+
+  The sniffer runs **only while the modem is not joined**. Sniffing as a member of the network
+  disturbs the running charging session: measured inside one session, the charger's own message
+  rate fell from 318 per 20 s to 18, and recovered after switching the sniffer off. The serial
+  command `sniff on` forces it anyway and exists only for that test.
 - **Frame log:** a ring buffer of 14 entries, narrowed (not shortened) to make room for the panel:
   uptime in whole seconds, MME/message name (still the full 20 characters it always had), and the
   last **2** bytes of the source MAC (was 3 - the extra byte wasn't worth the width once the panel

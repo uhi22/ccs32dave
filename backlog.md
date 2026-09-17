@@ -129,13 +129,13 @@ fields update correctly frame by frame.
 
 **Status:** done.
 
-Target/present voltage+current and SoC turn mid-gray after 2 s without a fresh value, dark gray after 4 s.
+Target/present voltage+current and SoC turn mid-gray after 2 s without a fresh value, dark gray after 4 s. Every value ages on its own: during pre-charge only the voltages are sent, so the currents gray out while the voltages keep updating.
 
 ## backlog_0006: show whether a CCo is in sight
 
 **Status:** done.
 
-When not joined, the network line shows "beacons" (orange) plus a 5-segment meter (beacons received in the last ~200 ms) while a CCo's beacons are received, otherwise "not joined". Reacts within 200 ms. Uses the modem's `VS_SNIFFER` indications (received beacons only); the sniffer runs from startup and is switched off while SLAC or IP traffic flows.
+When not joined, the network line shows "beacons" (orange) plus a 5-segment meter (beacons received in the last ~200 ms) while a CCo's beacons are received, otherwise "not joined". Reacts within 200 ms. Uses the modem's `VS_SNIFFER` indications (received beacons only). The sniffer runs while the modem is not joined (from startup on) and is switched off once it is joined; join status is polled every second with `VS_NW_INFO`.
 
 ## backlog_0007: serial diagnosis interface for the MMEs (done, 2026-09-15)
 
@@ -222,3 +222,74 @@ The `CM_NW_INFO.CNF` layout (MMV 1, FMI, NumNWs, then NID(7), SNID, TEI, role, C
 - [x] Modems that stop answering disappear from the table (seen at each modem reset)
 - [x] Join status polled via MME and shown
 - [x] Check on the TFT: modem lines, join status, and that the uptime keeps updating smoothly during SLAC traffic
+
+## backlog_0008: second screen page ("page2")
+
+**Status:** implemented and compile-checked 2026-09-17; not yet tested on the bench.
+
+The session-setup details (backlog_0009, backlog_0010) don't fit on the main page. Add a second
+full-screen page for them. The header (title, uptime) stays on both pages. Only the visible page is
+drawn; data for both pages is collected all the time, and switching redraws the page completely.
+
+**Decided (owner, 2026-09-17):** a separate push button on **GPIO 16** (input with internal
+pull-up, button to GND) toggles the page; 30 ms software debounce. No automatic switching, no
+serial command. The BOOT button was rejected (hard to reach).
+
+## backlog_0009: page2 - SDP: encrypted (TLS) or unencrypted
+
+**Status:** implemented and compile-checked 2026-09-17; not yet tested on the bench.
+
+Show what the car asks for in the SDP request (security: TLS / no TLS, transport: TCP / UDP) and
+what the charger answers in the SDP response (security, transport, its IPv6 address and TCP port).
+Both are V2GTP messages over UDP port 15118 (request payload type `0x9000`, response `0x9001`).
+If TLS is chosen, the DIN/ISO messages can't be decoded: the main page then shows a red "TLS" in
+its header (owner decision 2026-09-17).
+Page 2 stays coloured while the session is alive (any SDP or V2G message), grays as a whole after 3 s of quiet, and is cleared on the SLAC match so nothing of the previous session can reappear.
+
+**Solved 2026-09-17 with modem firmware `PINGPONG-RELEASE-5`.** Both SDP messages now arrive in
+the same session (verified: request + response three times in a row, the car retried, then the
+handshake request and response).
+
+How it was found, against the charger's own `eth0` as ground truth:
+
+- Each SDP message is only delivered under one of the two TEIs the ping-pong firmware switches
+  between: the request while it holds the charger's TEI, the response while it holds the car's.
+  RELEASE-2 (seeded charger, first switch only on TCP data) therefore always missed the response;
+  seeding the car instead showed the response but lost the request.
+- So the SDP messages themselves now drive the switching: seed the charger's TEI, switch to the
+  car's on the request, back to the charger's on the response (57 ms apart), then the normal
+  per-TCP-data alternation.
+- The last blocker was a length check, not the TEI logic: the request frame is only 72 bytes
+  (14 + 40 + 8 + 10), while the stub dropped everything below 74 bytes. Gate is now 68.
+- Independent of this, if the modem hasn't joined yet (seen with 120 s sessions) the whole session
+  start is missed - the auto-join first has to overhear the SLAC match.
+
+## backlog_0010: page2 - offered and selected XML schemas
+
+**Status:** implemented and compile-checked 2026-09-17; not yet tested on the bench.
+
+From the app handshake: list every schema the car offers in `supportedAppProtocolReq` (namespace,
+e.g. `urn:din:70121:2012:MsgDef`, version major/minor, SchemaID, priority), and show which one the
+charger selects in `supportedAppProtocolRes` (SchemaID, resolved to the namespace, plus the
+response code: OK / OK with minor deviation / failed). The handshake is already decoded
+(`v2g_exi.cpp`), only the message name is used so far.
+
+## backlog_0011: never sniff while joined
+
+**Status:** done (rule implemented in backlog_0006).
+
+Sniffing while the modem is a member of the network disturbs the real charging session. Measured
+2026-09-17 inside one running session: the charger's own message rate fell from 318 per 20 s to 94
+and then 18 with the sniffer forced on, and recovered to 163 after switching back. While not
+joined, the sniffer does not disturb anything (sessions ran normally with it active during SLAC).
+`sniff on` (diag) forces it anyway and is a test aid only.
+
+## backlog_0012: SPI clock raised to 4 MHz
+
+**Status:** done.
+
+2 MHz was the ported default. Measured 2026-09-17 against the charger's own message count, one
+charging phase each: 4 MHz captured 458 of ~486 messages (94%) with 0 SPI errors and 77 ms worst
+loop; 8 MHz 91% with 5 errors; 2 MHz no errors either. 4 MHz gives headroom for the sniffer stream
+(~19 kB/s) without the 8 MHz errors, so 4 MHz it is. The worst-case loop time comes from drawing
+and serial output, not from the SPI clock.

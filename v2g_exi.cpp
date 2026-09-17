@@ -186,10 +186,34 @@ static bool decodeAppHand(const uint8_t *data, uint16_t len, V2gValues &out) {
   }
   if (s_aphsDoc.supportedAppProtocolReq_isUsed) {
     strlcpy(out.msgName, "SupportedAppProtocolReq", sizeof(out.msgName));
+    const auto &list = s_aphsDoc.supportedAppProtocolReq.AppProtocol;
+    uint8_t n = list.arrayLen < V2gValues::MAX_APP_PROTOCOLS ? list.arrayLen
+                                                               : V2gValues::MAX_APP_PROTOCOLS;
+    for (uint8_t i = 0; i < n; i++) {
+      const struct appHandAppProtocolType &src = list.array[i];
+      V2gValues::AppProtocol &dst = out.appProtocols[i];
+      uint16_t len = src.ProtocolNamespace.charactersLen;
+      if (len > sizeof(dst.ns) - 1) len = sizeof(dst.ns) - 1;
+      for (uint16_t c = 0; c < len; c++) {
+        char ch = (char)src.ProtocolNamespace.characters[c];  // char or uint32_t, per EXI config
+        dst.ns[c] = (ch < 0x20 || ch > 0x7E) ? '?' : ch;
+      }
+      dst.ns[len] = '\0';
+      dst.versionMajor = (uint8_t)src.VersionNumberMajor;
+      dst.versionMinor = (uint8_t)src.VersionNumberMinor;
+      dst.schemaId = src.SchemaID;
+      dst.priority = src.Priority;
+    }
+    out.appProtocolCount = n;
     return true;
   }
   if (s_aphsDoc.supportedAppProtocolRes_isUsed) {
     strlcpy(out.msgName, "SupportedAppProtocolRes", sizeof(out.msgName));
+    const auto &res = s_aphsDoc.supportedAppProtocolRes;
+    out.hasHandshakeResult = true;
+    out.handshakeResponseCode = (uint8_t)res.ResponseCode;
+    out.hasSelectedSchema = res.SchemaID_isUsed;
+    out.selectedSchemaId = res.SchemaID;
     return true;
   }
   strlcpy(out.msgName, "appHand?", sizeof(out.msgName));

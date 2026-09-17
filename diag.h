@@ -19,6 +19,8 @@
 //   qreset               QRESET done   restart the modem over SPI (SLAVE_RESET)
 //   bcast 0|1            BCAST <0|1>   periodic GET_SW.REQ / CM_NW_INFO.REQ broadcasts
 //   log 0|1              LOG <0|1>     one "F ..." line per received frame
+//   sniff on|auto        SNIFF <on|auto>   test aid: keep the VS_SNIFFER stream on even while
+//                                      joined (auto = on only while not joined)
 //   help                 HELP ...
 // A command without answer from the modem ends with "<TAG> <addr> timeout".
 // Numbers may be given as hex (0x prefix) or decimal.
@@ -41,6 +43,7 @@ public:
 
   bool periodicRequests() const { return _periodicRequests; }
   bool logTraffic() const { return _logTraffic; }
+  bool snifferForced() const { return _snifferForced; }
 
 private:
   enum class Kind : uint8_t { None, Read, Write, NwInfo, PingPongBlock, PingPongOwnTei };
@@ -66,4 +69,5 @@ private:
 
   bool _periodicRequests = true;
   bool _logTraffic = true;
+  bool _snifferForced = false;
 };

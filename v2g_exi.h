@@ -20,6 +20,19 @@ struct V2gValues {
 
   bool hasResponseCode = false;
   uint8_t responseCode = 0;  // dinresponseCodeType - 0 = OK, see dinEXIDatatypes.h
+
+  // App handshake (backlog_0010). The decoder keeps at most 5 offered protocols.
+  struct AppProtocol {
+    char ns[48];  // e.g. "urn:din:70121:2012:MsgDef" (truncated if longer)
+    uint8_t versionMajor, versionMinor, schemaId, priority;
+  };
+  static constexpr uint8_t MAX_APP_PROTOCOLS = 5;
+  uint8_t appProtocolCount = 0;  // > 0: this was a supportedAppProtocolReq
+  AppProtocol appProtocols[MAX_APP_PROTOCOLS];
+  bool hasHandshakeResult = false;  // this was a supportedAppProtocolRes
+  uint8_t handshakeResponseCode = 0;  // 0 OK, 1 OK with minor deviation, 2 failed
+  bool hasSelectedSchema = false;
+  uint8_t selectedSchemaId = 0;
 };
 
 // `data`/`len` is the EXI payload only (the V2GTP message minus its 8-byte header). Returns

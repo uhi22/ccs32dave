@@ -38,18 +38,20 @@
 #define QCA_MISO  6   // QCA SPI_SO
 #define QCA_CS   15
 
-#define QCA_SPI_FREQUENCY       2000000UL
+#define QCA_SPI_FREQUENCY       4000000UL
 #define QCA_POLL_INTERVAL_MS    10     // fetch received frames
 #define QCA_CHECK_INTERVAL_MS   1000   // signature check
-#define QCA_REQUEST_INTERVAL_MS 5000   // GET_SW.REQ and CM_NW_INFO.REQ
+#define QCA_REQUEST_INTERVAL_MS 5000   // GET_SW.REQ broadcast (modem list)
 #define QCA_MAX_AGE_MS          (3 * QCA_REQUEST_INTERVAL_MS + 500)
+// Join status of the local modem: VS_NW_INFO.REQ, sent only to the local modem (not onto the
+// powerline), every second. The sniffer's desired state is re-sent in the same cycle, so a lost
+// VS_SNIFFER.REQ or a modem reset heals within a second.
+#define QCA_STATUS_INTERVAL_MS  1000
+#define QCA_STATUS_MAX_AGE_MS   3500   // join status counts as unknown after this
 
-// backlog-0056: auto-toggle VS_SNIFFER so we can tell "no PLC CCo visible" apart from "beacons
-// seen but no SLAC/IP" - enable whenever idle, disable once real traffic is flowing again (the
-// .IND stream would otherwise spam the SPI link for no extra information). Deliberately the same
-// value as QCA_REQUEST_INTERVAL_MS: the toggle is driven from sendRequests(), so it needs no
-// timer of its own and self-heals (resent every cycle) if one REQ is dropped.
-#define SNIFFER_IDLE_MS         QCA_REQUEST_INTERVAL_MS
+// Sniffer rule (backlog_0006, revised 2026-09-17): on while the local modem is not joined, off
+// while joined. `sniff on` (diag) keeps it on regardless - a test aid to produce the .IND load of a
+// running session.
 // "beacons only" stays on until this long after the last received beacon. Owner requirement
 // 2026-09-15: at most 200 ms from beacon indication to TFT, both on and off. The AR7420 beacons
 // every 40 ms (largest gap seen 71 ms), so 150 ms bridges one lost beacon and leaves ~50 ms for
@@ -62,6 +64,18 @@
 #define SNIFFER_METER_WINDOW_MS 230
 #define SNIFFER_METER_SEGMENTS 5
 #define PANEL_REFRESH_INTERVAL_MS 500  // re-evaluate time-based panel state (the value fade)
+
+// ---- Page button (backlog_0008) -----------------------------------------------
+// Push button to GND, internal pull-up; a press toggles main page / page 2. GPIO 16 is free on
+// every ESP32-S3 module (it is only the 32 kHz crystal pin if such a crystal is fitted - not on
+// the DevKitC-1) and is not a strapping, flash, PSRAM or USB pin.
+#define PAGE_BUTTON_PIN 16
+#define PAGE_BUTTON_DEBOUNCE_MS 30
+// Page 2 shows one session's setup, so it does not age per value: it stays coloured while V2G
+// messages (or SDP) keep arriving and grays as a whole once the session has been quiet this long
+// (owner decision 2026-09-17). A new session clears it on the SLAC match, so nothing from the
+// previous one can turn coloured again.
+#define PAGE2_QUIET_MS 3000
 
 #define SERIAL_BAUD 921600  // high rate, so logging every frame doesn't slow down the loop
 
@@ -111,10 +125,6 @@ struct SnifferStatus {
   uint8_t levelMin = 255, levelMax = 0, levelChanges = 0;  // for the SNIF summary line
 };
 SnifferStatus sniffer;
-// Last SLAC-or-IP frame seen (NOT our own periodic GET_SW/NW_INFO polling, and NOT a
-// VS_SNIFFER.IND - see onHomeplugFrame()). 0 = none yet since boot, which correctly starts the
-// idle timer running from power-on.
-uint32_t lastRealTrafficMs = 0;
 
 bool panelDirty = true;
 
@@ -477,6 +487,15 @@ void showSplashScreen() {
 
 // ---- Screen -----------------------------------------------------------------
 
+uint8_t page = 1;  // 1 = main page, 2 = session setup (backlog_0008)
+
+// Static parts of the main page, below the header
+void drawMainStatic() {
+  tft.drawFastHLine(0, COLUMNS_TOP_Y, tft.width(), COLOR_DARKGREY);
+  tft.drawFastHLine(0, COLUMNS_BOTTOM_Y, tft.width(), COLOR_DARKGREY);
+  tft.drawFastVLine(PANEL_DIVIDER_X, COLUMNS_TOP_Y, COLUMNS_BOTTOM_Y - COLUMNS_TOP_Y, COLOR_DARKGREY);
+}
+
 void drawStaticScreen() {
   tft.fillScreen(ILI9341_BLACK);
   tft.setTextWrap(false);
@@ -489,21 +508,21 @@ void drawStaticScreen() {
   tft.drawRect(UPTIME_X - 4, UPTIME_Y - 4, UPTIME_W + 8, UPTIME_H + 8, COLOR_DARKGREY);
 
   tft.drawFastHLine(0, HEADER_LINE_Y, tft.width(), COLOR_DARKGREY);
-  tft.drawFastHLine(0, COLUMNS_TOP_Y, tft.width(), COLOR_DARKGREY);
-  tft.drawFastHLine(0, COLUMNS_BOTTOM_Y, tft.width(), COLOR_DARKGREY);
-  tft.drawFastVLine(PANEL_DIVIDER_X, COLUMNS_TOP_Y, COLUMNS_BOTTOM_Y - COLUMNS_TOP_Y, COLOR_DARKGREY);
+  drawMainStatic();
 }
 
 // V2G values decoded from the reassembled DIN EXI traffic (backlog-0050/0051). Persist across
 // messages - e.g. CurrentDemandRes doesn't repeat the target values, so the display keeps
 // showing the last one seen until a newer message updates it (or the modem disappears).
 struct V2gDisplay {
-  bool hasTarget = false;
-  float targetVoltage = 0, targetCurrent = 0;      // from CurrentDemandReq (PEV -> EVSE)
-  uint32_t targetUpdatedMs = 0;                    // backlog-0055: for the stale-value fade
-  bool hasPresent = false;
-  float presentVoltage = 0, presentCurrent = 0;    // from CurrentDemandRes (EVSE -> PEV)
-  uint32_t presentUpdatedMs = 0;
+  // One "has" flag and one timestamp per value: during pre-charge only the voltages are sent,
+  // so the currents must age out on their own.
+  bool hasTargetVoltage = false, hasTargetCurrent = false;
+  float targetVoltage = 0, targetCurrent = 0;      // PreChargeReq (V only) / CurrentDemandReq
+  uint32_t targetVoltageMs = 0, targetCurrentMs = 0;
+  bool hasPresentVoltage = false, hasPresentCurrent = false;
+  float presentVoltage = 0, presentCurrent = 0;    // PreChargeRes (V only) / CurrentDemandRes
+  uint32_t presentVoltageMs = 0, presentCurrentMs = 0;
   bool hasSoc = false;
   int8_t soc = 0;                                  // DC_EVStatus.EVRESSSOC, from the PEV
   uint32_t socUpdatedMs = 0;
@@ -515,31 +534,107 @@ struct V2gDisplay {
 };
 V2gDisplay v2gDisplay;
 
+// Session setup shown on page 2 (backlog_0009/0010). Kept until overwritten by the next session;
+// page 2 grays as a whole after PAGE2_QUIET_MS without V2G traffic, and is cleared on a SLAC match.
+struct SessionSetup {
+  bool hasSdpReq = false;
+  uint8_t reqSecurity = 0, reqTransport = 0;
+  bool hasSdpRes = false;
+  uint8_t resSecurity = 0, resTransport = 0;
+  uint8_t evseIp[16] = {};
+  uint16_t evsePort = 0;
+  uint8_t appProtocolCount = 0;
+  V2gValues::AppProtocol appProtocols[V2gValues::MAX_APP_PROTOCOLS];
+  bool hasHandshakeResult = false;
+  uint8_t handshakeResponseCode = 0;
+  bool hasSelectedSchema = false;
+  uint8_t selectedSchemaId = 0;
+  uint32_t lastActivityMs = 0;  // last SDP or V2G message of this session
+};
+SessionSetup sessionSetup;
+
+// SDP values (DIN 70121 / ISO 15118-2)
+static const uint8_t SDP_SECURITY_TLS = 0x00;
+static const uint8_t SDP_SECURITY_NONE = 0x10;
+static const uint8_t SDP_TRANSPORT_TCP = 0x00;
+static const uint8_t SDP_TRANSPORT_UDP = 0x10;
+
+const char *sdpSecurityName(uint8_t s) {
+  return s == SDP_SECURITY_TLS ? "TLS" : s == SDP_SECURITY_NONE ? "no TLS" : "sec?";
+}
+
+const char *sdpTransportName(uint8_t t) {
+  return t == SDP_TRANSPORT_TCP ? "TCP" : t == SDP_TRANSPORT_UDP ? "UDP" : "?";
+}
+
+const char *handshakeResultName(uint8_t rc) {
+  static const char *const NAMES[] = {"OK", "OK, minor deviation", "failed, no negotiation"};
+  return rc < 3 ? NAMES[rc] : "?";
+}
+
+void storeHandshake(const V2gValues &v) {
+  uint32_t t = millis();
+  if (v.appProtocolCount > 0) {
+    sessionSetup.appProtocolCount = v.appProtocolCount;
+    memcpy(sessionSetup.appProtocols, v.appProtocols, sizeof(sessionSetup.appProtocols));
+    Serial.printf("AppHandshake req: %u protocol(s)\n", v.appProtocolCount);
+    for (uint8_t i = 0; i < v.appProtocolCount; i++) {
+      const V2gValues::AppProtocol &a = v.appProtocols[i];
+      Serial.printf("  ID %u prio %u v%u.%u %s\n", a.schemaId, a.priority, a.versionMajor,
+                    a.versionMinor, a.ns);
+    }
+  }
+  if (v.hasHandshakeResult) {
+    sessionSetup.hasHandshakeResult = true;
+    sessionSetup.handshakeResponseCode = v.handshakeResponseCode;
+    sessionSetup.hasSelectedSchema = v.hasSelectedSchema;
+    sessionSetup.selectedSchemaId = v.selectedSchemaId;
+    if (v.hasSelectedSchema) {
+      Serial.printf("AppHandshake res: %s, schema ID %u\n",
+                    handshakeResultName(v.handshakeResponseCode), v.selectedSchemaId);
+    } else {
+      Serial.printf("AppHandshake res: %s, no schema\n", handshakeResultName(v.handshakeResponseCode));
+    }
+  }
+}
+
 // Applies one decode result (ok=false: v.msgName carries a short error tag instead) to the
 // persistent display state above. Prints to serial only when the shown VALUES actually
 // change (not on every message) - same convention as printModemTable() / the "Network:"
 // line elsewhere in this file, so the TFT's content can be checked without seeing the screen.
 //
-// backlog-0055: each of the three field groups (target V+A, present V+A, SoC) gets its own
-// "last updated" timestamp, refreshed whenever a message carries that group AT ALL - even if
-// the value repeated - because target/present/SoC arrive in different DIN messages at different
-// times and so go stale independently of each other.
+// Each VALUE has its own "last updated" timestamp, refreshed whenever a message carries it at all
+// (even if the value repeated). Not per group: PreChargeReq carries only the target voltage and
+// PreChargeRes only the present voltage, so during pre-charge the currents are stale while the
+// voltages keep updating - with a shared timestamp the currents kept showing the previous
+// session's 10 A in full color (owner report 2026-09-17).
 void applyV2gValues(const V2gValues &v, bool ok) {
+  sessionSetup.lastActivityMs = millis();  // the session is alive - keeps page 2 coloured; also on
+                                           // a failed decode, which is still V2G traffic
   if (ok) {
+    storeHandshake(v);
     v2gDisplay.decoded++;
     bool changed = false;
     uint32_t now = millis();
-    if (v.hasTargetVoltage || v.hasTargetCurrent) {
-      if (v.hasTargetVoltage && v.targetVoltage != v2gDisplay.targetVoltage) { v2gDisplay.targetVoltage = v.targetVoltage; changed = true; }
-      if (v.hasTargetCurrent && v.targetCurrent != v2gDisplay.targetCurrent) { v2gDisplay.targetCurrent = v.targetCurrent; changed = true; }
-      v2gDisplay.hasTarget = true;
-      v2gDisplay.targetUpdatedMs = now;
+    if (v.hasTargetVoltage) {
+      if (v.targetVoltage != v2gDisplay.targetVoltage) { v2gDisplay.targetVoltage = v.targetVoltage; changed = true; }
+      v2gDisplay.hasTargetVoltage = true;
+      v2gDisplay.targetVoltageMs = now;
     }
-    if (v.hasPresentVoltage || v.hasPresentCurrent) {
-      if (v.hasPresentVoltage && v.presentVoltage != v2gDisplay.presentVoltage) { v2gDisplay.presentVoltage = v.presentVoltage; changed = true; }
-      if (v.hasPresentCurrent && v.presentCurrent != v2gDisplay.presentCurrent) { v2gDisplay.presentCurrent = v.presentCurrent; changed = true; }
-      v2gDisplay.hasPresent = true;
-      v2gDisplay.presentUpdatedMs = now;
+    if (v.hasTargetCurrent) {
+      if (v.targetCurrent != v2gDisplay.targetCurrent) { v2gDisplay.targetCurrent = v.targetCurrent; changed = true; }
+      v2gDisplay.hasTargetCurrent = true;
+      v2gDisplay.targetCurrentMs = now;
+    }
+    if (v.hasPresentVoltage) {
+      if (v.presentVoltage != v2gDisplay.presentVoltage) { v2gDisplay.presentVoltage = v.presentVoltage; changed = true; }
+      v2gDisplay.hasPresentVoltage = true;
+      v2gDisplay.presentVoltageMs = now;
+    }
+    if (v.hasPresentCurrent) {
+      if (v.presentCurrent != v2gDisplay.presentCurrent) { v2gDisplay.presentCurrent = v.presentCurrent; changed = true; }
+      v2gDisplay.hasPresentCurrent = true;
+      v2gDisplay.presentCurrentMs = now;
     }
     if (v.hasSoc) {
       if (v.soc != v2gDisplay.soc) { v2gDisplay.soc = v.soc; changed = true; }
@@ -606,9 +701,9 @@ void drawPanel() {
       drawLine(networkLine, ILI9341_YELLOW, "not joined");
     }
   } else {
-    snprintf(buf, sizeof(buf), "joined %s TEI%u",
-             network.info.role < 3 ? ROLE[network.info.role] : "?",
-             network.info.tei);
+    // No TEI here: the ping-pong firmware flips the modem's own TEI per frame, so it says nothing
+    // and would only make the line flicker.
+    snprintf(buf, sizeof(buf), "joined %s", network.info.role < 3 ? ROLE[network.info.role] : "?");
     drawLine(networkLine, ILI9341_GREEN, buf);
   }
 
@@ -632,32 +727,32 @@ void drawPanel() {
 
   // V2G value panel (backlog-0051; layout backlog-0055): big stacked numbers, right column.
   drawLine(targetLabelLine, COLOR_DARKGREY, "TARGET");
-  if (v2gDisplay.hasTarget) {
+  if (v2gDisplay.hasTargetVoltage) {
     snprintf(buf, sizeof(buf), "%.1fV", v2gDisplay.targetVoltage);
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(targetVoltLine, staleColor(ILI9341_YELLOW, v2gDisplay.hasTarget, v2gDisplay.targetUpdatedMs), buf);
-  if (v2gDisplay.hasTarget) {
+  drawLine(targetVoltLine, staleColor(ILI9341_YELLOW, v2gDisplay.hasTargetVoltage, v2gDisplay.targetVoltageMs), buf);
+  if (v2gDisplay.hasTargetCurrent) {
     snprintf(buf, sizeof(buf), "%.1fA", v2gDisplay.targetCurrent);
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(targetCurrLine, staleColor(ILI9341_YELLOW, v2gDisplay.hasTarget, v2gDisplay.targetUpdatedMs), buf);
+  drawLine(targetCurrLine, staleColor(ILI9341_YELLOW, v2gDisplay.hasTargetCurrent, v2gDisplay.targetCurrentMs), buf);
 
   drawLine(presentLabelLine, COLOR_DARKGREY, "PRESENT");
-  if (v2gDisplay.hasPresent) {
+  if (v2gDisplay.hasPresentVoltage) {
     snprintf(buf, sizeof(buf), "%.1fV", v2gDisplay.presentVoltage);
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(presentVoltLine, staleColor(ILI9341_GREEN, v2gDisplay.hasPresent, v2gDisplay.presentUpdatedMs), buf);
-  if (v2gDisplay.hasPresent) {
+  drawLine(presentVoltLine, staleColor(ILI9341_GREEN, v2gDisplay.hasPresentVoltage, v2gDisplay.presentVoltageMs), buf);
+  if (v2gDisplay.hasPresentCurrent) {
     snprintf(buf, sizeof(buf), "%.1fA", v2gDisplay.presentCurrent);
   } else {
     strlcpy(buf, "-", sizeof(buf));
   }
-  drawLine(presentCurrLine, staleColor(ILI9341_GREEN, v2gDisplay.hasPresent, v2gDisplay.presentUpdatedMs), buf);
+  drawLine(presentCurrLine, staleColor(ILI9341_GREEN, v2gDisplay.hasPresentCurrent, v2gDisplay.presentCurrentMs), buf);
 
   drawLine(socLabelLine, COLOR_DARKGREY, "SoC");
   if (v2gDisplay.hasSoc) {
@@ -685,6 +780,167 @@ void drawPanel() {
            (unsigned long)qca.txFrames(), (unsigned long)qca.rxFrames(),
            (unsigned long)qca.errors(), modem.signature);
   drawLine(counterLine, COLOR_DARKGREY, buf);
+}
+
+// ---- Page 2: session setup (backlog_0008..0010) -------------------------------
+
+TextLine headerHintLine = {126, 3, 2, 4};  // "TLS" in the header, both pages
+
+TextLine p2SdpHead = {TEXT_X, 26, 1};
+TextLine p2SdpCar = {TEXT_X, 37, 2};
+TextLine p2SdpEvse = {TEXT_X, 55, 2};
+TextLine p2SdpAddr = {TEXT_X, 73, 1};
+static const int16_t PAGE2_DIVIDER_Y = 84;  // between the SDP block above and the schemas below
+TextLine p2AphHead = {TEXT_X, 89, 1};
+TextLine p2AphLines[V2gValues::MAX_APP_PROTOCOLS] = {
+    {TEXT_X, 100, 1}, {TEXT_X, 110, 1}, {TEXT_X, 120, 1}, {TEXT_X, 130, 1}, {TEXT_X, 140, 1}};
+TextLine p2AphResult = {TEXT_X, 154, 1};
+TextLine p2AphSelected = {TEXT_X, 166, 2};
+TextLine p2Footer = {TEXT_X, 229, 1};
+
+// TLS negotiated -> the DIN messages can't be decoded, so say it on both pages. "TLS?" if only
+// the car's request is known (the charger's response may not reach us - backlog_0009).
+void drawHeaderHint() {
+  if (sessionSetup.hasSdpRes) {
+    drawLine(headerHintLine, ILI9341_RED,
+             sessionSetup.resSecurity == SDP_SECURITY_TLS ? "TLS" : "");
+  } else if (sessionSetup.hasSdpReq && sessionSetup.reqSecurity == SDP_SECURITY_TLS) {
+    drawLine(headerHintLine, ILI9341_ORANGE, "TLS?");
+  } else {
+    drawLine(headerHintLine, ILI9341_RED, "");
+  }
+}
+
+// Coloured while the session is alive, gray once it has been quiet - one decision for the whole
+// page, so its values never disagree about which session they belong to.
+bool page2Quiet() {
+  return sessionSetup.lastActivityMs == 0 ||
+         millis() - sessionSetup.lastActivityMs >= PAGE2_QUIET_MS;
+}
+
+uint16_t page2Color(uint16_t freshColor) {
+  return page2Quiet() ? COLOR_DARKGREY : freshColor;
+}
+
+const char *protocolShortName(const char *ns) {
+  if (strstr(ns, "din:70121")) return "DIN 70121";
+  if (strstr(ns, "15118:2:2010")) return "ISO 15118-2:2010";
+  if (strstr(ns, "15118:2:2013")) return "ISO 15118-2:2013";
+  if (strstr(ns, "15118:-20")) return "ISO 15118-20";
+  return ns;
+}
+
+void drawPage2() {
+  const SessionSetup &s = sessionSetup;
+  char buf[65];
+
+  drawLine(p2SdpHead, COLOR_DARKGREY, "SDP - transport security");
+  if (s.hasSdpReq) {
+    snprintf(buf, sizeof(buf), "Car:  %s %s", sdpSecurityName(s.reqSecurity),
+             sdpTransportName(s.reqTransport));
+    drawLine(p2SdpCar, page2Color(s.reqSecurity == SDP_SECURITY_NONE ? ILI9341_GREEN : ILI9341_RED),
+             buf);
+  } else {
+    drawLine(p2SdpCar, COLOR_DARKGREY, "Car:  -");
+  }
+  if (s.hasSdpRes) {
+    snprintf(buf, sizeof(buf), "EVSE: %s %s", sdpSecurityName(s.resSecurity),
+             sdpTransportName(s.resTransport));
+    drawLine(p2SdpEvse, page2Color(s.resSecurity == SDP_SECURITY_NONE ? ILI9341_GREEN : ILI9341_RED),
+             buf);
+    const uint8_t *a = s.evseIp;
+    snprintf(buf, sizeof(buf), "EVSE %x:%x:%x:%x:%x:%x:%x:%x port %u",
+             (a[0] << 8) | a[1], (a[2] << 8) | a[3], (a[4] << 8) | a[5], (a[6] << 8) | a[7],
+             (a[8] << 8) | a[9], (a[10] << 8) | a[11], (a[12] << 8) | a[13], (a[14] << 8) | a[15],
+             s.evsePort);
+    drawLine(p2SdpAddr, page2Color(ILI9341_WHITE), buf);
+  } else {
+    drawLine(p2SdpEvse, COLOR_DARKGREY, "EVSE: -");
+    drawLine(p2SdpAddr, COLOR_DARKGREY, "");
+  }
+
+  drawLine(p2AphHead, COLOR_DARKGREY, "Schemas offered by the car (> = selected)");
+  const V2gValues::AppProtocol *selected = nullptr;
+  for (uint8_t i = 0; i < V2gValues::MAX_APP_PROTOCOLS; i++) {
+    if (i >= s.appProtocolCount) {
+      drawLine(p2AphLines[i], COLOR_DARKGREY, i == 0 ? "-" : "");
+      continue;
+    }
+    const V2gValues::AppProtocol &a = s.appProtocols[i];
+    bool isSelected = s.hasHandshakeResult && s.hasSelectedSchema &&
+                      s.selectedSchemaId == a.schemaId;
+    if (isSelected) selected = &a;
+    snprintf(buf, sizeof(buf), "%cID%u P%u v%u.%u %s", isSelected ? '>' : ' ', a.schemaId,
+             a.priority, a.versionMajor, a.versionMinor, a.ns);
+    drawLine(p2AphLines[i], page2Color(isSelected ? ILI9341_GREEN : ILI9341_WHITE), buf);
+  }
+
+  if (s.hasHandshakeResult) {
+    bool okResult = s.handshakeResponseCode < 2;
+    if (s.hasSelectedSchema) {
+      snprintf(buf, sizeof(buf), "Charger: %s, schema ID %u",
+               handshakeResultName(s.handshakeResponseCode), s.selectedSchemaId);
+    } else {
+      snprintf(buf, sizeof(buf), "Charger: %s", handshakeResultName(s.handshakeResponseCode));
+    }
+    uint16_t color = page2Color(okResult ? ILI9341_GREEN : ILI9341_RED);
+    drawLine(p2AphResult, color, buf);
+    if (selected) {
+      snprintf(buf, sizeof(buf), "-> %s", protocolShortName(selected->ns));
+    } else if (s.hasSelectedSchema) {
+      snprintf(buf, sizeof(buf), "-> ID %u", s.selectedSchemaId);
+    } else {
+      strlcpy(buf, "-> none", sizeof(buf));
+    }
+    drawLine(p2AphSelected, color, buf);
+  } else {
+    drawLine(p2AphResult, COLOR_DARKGREY, "Charger: -");
+    drawLine(p2AphSelected, COLOR_DARKGREY, "");
+  }
+
+  drawLine(p2Footer, COLOR_DARKGREY, "page 2 - press the button for the main page");
+}
+
+// Everything below the header is redrawn from scratch after a page switch.
+void showPage(uint8_t p) {
+  static TextLine *const LINES[] = {
+      &statusLine, &networkLine, &modemLines[0], &modemLines[1], &modemLines[2],
+      &targetLabelLine, &targetVoltLine, &targetCurrLine, &presentLabelLine, &presentVoltLine,
+      &presentCurrLine, &socLabelLine, &socValueLine, &msgLine, &rcLine, &counterLine,
+      &p2SdpHead, &p2SdpCar, &p2SdpEvse, &p2SdpAddr, &p2AphHead, &p2AphLines[0], &p2AphLines[1],
+      &p2AphLines[2], &p2AphLines[3], &p2AphLines[4], &p2AphResult, &p2AphSelected, &p2Footer};
+  page = p;
+  tft.fillRect(0, HEADER_LINE_Y + 1, tft.width(), tft.height() - HEADER_LINE_Y - 1, ILI9341_BLACK);
+  for (TextLine *line : LINES) {
+    line->drawn = false;
+  }
+  meterShown = -1;
+  if (page == 1) {
+    drawMainStatic();
+    logDirty = true;
+  } else {
+    // divider between the SDP block and the schema block
+    tft.drawFastHLine(0, PAGE2_DIVIDER_Y, tft.width(), COLOR_DARKGREY);
+  }
+  panelDirty = true;
+  Serial.printf("Page: %u\n", page);
+}
+
+// Called on every loop() pass. Button to GND with pull-up: pressed = LOW.
+void pollPageButton(uint32_t now) {
+  static bool lastRaw = HIGH;
+  static bool stable = HIGH;
+  static uint32_t lastChangeMs = 0;
+  bool raw = digitalRead(PAGE_BUTTON_PIN);
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastChangeMs = now;
+  } else if (raw != stable && now - lastChangeMs >= PAGE_BUTTON_DEBOUNCE_MS) {
+    stable = raw;
+    if (stable == LOW) {
+      showPage(page == 1 ? 2 : 1);
+    }
+  }
 }
 
 void drawUptime(uint64_t centiseconds) {
@@ -733,11 +989,8 @@ void logFrame(const uint8_t *frame, uint16_t len, const char *description) {
 void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
   uint16_t mm = homeplug::mmtype(frame);
   if ((mm & 0xFFFC) == 0xA034) {
-    // backlog-0056: the whole VS_SNIFFER family (REQ 0xA034, CNF 0xA035 - the ack for our own
-    // toggle - IND 0xA036) is deliberately NOT counted as real traffic below. Found the hard way
-    // on real hardware (2026-09-15): catching only the .IND wasn't enough - the .CNF answering
-    // OUR OWN request every 5 s cycle was itself enough to keep re-arming the idle timer every
-    // single cycle, so the sniffer could never see itself as idle and would never turn on at all.
+    // The whole VS_SNIFFER family (REQ 0xA034, CNF 0xA035 = ack for our own toggle, IND 0xA036)
+    // is ours: not logged, not counted as traffic.
     if (mm == homeplug::MMTYPE_VS_SNIFFER_IND) {
       handleSnifferInd(frame, len);
     }
@@ -753,38 +1006,50 @@ void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
     return;
   }
 
-  homeplug::NetworkInfo info;
-  if (homeplug::parseNwInfoCnf(frame, len, info)) {
-    // All modems answer the broadcast; only the local modem's view counts
-    if (ModemList::isLocal(info.mac)) {
+  homeplug::VsNetworkInfo vs;
+  if (homeplug::parseVsNwInfoCnf(frame, len, vs)) {
+    // Answer to our 1 s VS_NW_INFO.REQ (sent to the local modem only)
+    if (ModemList::isLocal(vs.mac)) {
+      homeplug::NetworkInfo info;
+      memset(&info, 0, sizeof(info));
+      memcpy(info.mac, vs.mac, 6);
+      info.numNetworks = vs.numAvlns;
+      info.tei = vs.ownTei;
+      info.role = vs.role;  // same coding as CM_NW_INFO: 0 STA, 1 PCo, 2 CCo
+      memcpy(info.ccoMac, vs.ccoMac, 6);
+      // The own TEI is deliberately NOT compared: the ping-pong firmware rewrites it per frame
+      // (bench 2026-09-17: it alternated every second), which would log and redraw constantly.
       bool changed = !network.valid ||
                      network.info.numNetworks != info.numNetworks ||
-                     network.info.tei != info.tei ||
                      network.info.role != info.role;
       if (changed) {
-        Serial.printf("Network: %s, TEI %u, role %u\n",
-                      info.numNetworks > 0 ? "joined" : "not joined",
-                      info.tei, info.role);
+        Serial.printf("Network: %s, role %u\n", info.numNetworks > 0 ? "joined" : "not joined",
+                      info.role);
         char buf[24];
-        if (info.numNetworks > 0) {
-          snprintf(buf, sizeof(buf), "** joined TEI %u", info.tei);
-        } else {
-          strlcpy(buf, "** not joined", sizeof(buf));
-        }
+        strlcpy(buf, info.numNetworks > 0 ? "** joined" : "** not joined", sizeof(buf));
         addLog(buf, ILI9341_YELLOW);
         panelDirty = true;
       }
       network.info = info;
       network.valid = true;
       network.receivedMs = millis();
+      if (changed) {
+        updateSnifferState();  // switch the sniffer right away, not a cycle later
+      }
     }
     return;
   }
 
-  // Other MMEs, e.g. SLAC between car and charger - counts as real traffic for the sniffer
-  // idle timer (backlog-0056), unlike the GET_SW/NW_INFO polling answers handled above.
+  // A SLAC match starts a new session: drop the previous session's setup, so nothing of it can
+  // turn coloured again if this session's SDP is missed (owner decision 2026-09-17 - clearing on
+  // the handshake request would be too late, that comes after SDP).
+  if ((mm & ~0x0003) == 0x607C) {
+    sessionSetup = SessionSetup();
+    panelDirty = true;
+  }
+
+  // Other MMEs, e.g. SLAC between car and charger
   traffic.mme++;
-  lastRealTrafficMs = millis();
   char name[24];
   homeplug::describeMmtype(homeplug::mmtype(frame), name, sizeof(name));
   addLog(name, ILI9341_CYAN, &frame[6]);
@@ -803,7 +1068,6 @@ void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
 // that's the ground truth used by the capture-ratio measurements (backlog-0048).
 void onIpv6Frame(const uint8_t *frame, uint16_t len) {
   traffic.ipv6++;
-  lastRealTrafficMs = millis();  // real traffic for the sniffer idle timer (backlog-0056)
   panelDirty = true;
 
   // Ethernet header 14 bytes, IPv6 header 40 bytes, then TCP/UDP ports
@@ -856,9 +1120,56 @@ void onIpv6Frame(const uint8_t *frame, uint16_t len) {
       }
     }
   } else if (strcmp(proto, "UDP") == 0) {
-    addLog(text, ILI9341_GREEN, &frame[6]);
+    char sdpText[24];
+    if (parseSdp(frame, len, ipPayloadLen, sdpText, sizeof(sdpText))) {
+      addLog(sdpText, ILI9341_GREEN, &frame[6]);
+      strlcat(description, " -> ", sizeof(description));
+      strlcat(description, sdpText, sizeof(description));
+    } else {
+      addLog(text, ILI9341_GREEN, &frame[6]);
+    }
   }
   logFrame(frame, len, description);
+}
+
+// SDP (backlog_0009): V2GTP over UDP - header 01 FE, payload type (2), length (4), then
+// request 0x9000 = security, transport; response 0x9001 = IPv6 address (16), port (2),
+// security, transport. Returns true and a short log text, e.g. "SDP res no TLS TCP".
+bool parseSdp(const uint8_t *frame, uint16_t len, uint16_t ipPayloadLen, char *text, size_t textLen) {
+  static const uint16_t OFS_V2GTP = 14 + 40 + 8;  // Ethernet, IPv6, UDP headers
+  if (ipPayloadLen < 8 + 8 || 54u + ipPayloadLen > len) {
+    return false;
+  }
+  const uint8_t *p = &frame[OFS_V2GTP];
+  if (p[0] != 0x01 || p[1] != 0xFE) {
+    return false;
+  }
+  uint16_t type = (p[2] << 8) | p[3];
+  uint32_t payloadLen = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) | (p[6] << 8) | p[7];
+  if (8u + 8u + payloadLen > ipPayloadLen) {
+    return false;
+  }
+  const uint8_t *d = &p[8];
+  SessionSetup &s = sessionSetup;
+  if (type == 0x9000 && payloadLen == 2) {
+    s.hasSdpReq = true;
+    s.reqSecurity = d[0];
+    s.reqTransport = d[1];
+    s.lastActivityMs = millis();
+    snprintf(text, textLen, "SDP req %s %s", sdpSecurityName(d[0]), sdpTransportName(d[1]));
+  } else if (type == 0x9001 && payloadLen == 20) {
+    s.hasSdpRes = true;
+    memcpy(s.evseIp, d, 16);
+    s.evsePort = (d[16] << 8) | d[17];
+    s.resSecurity = d[18];
+    s.resTransport = d[19];
+    s.lastActivityMs = millis();
+    snprintf(text, textLen, "SDP res %s %s", sdpSecurityName(d[18]), sdpTransportName(d[19]));
+  } else {
+    return false;
+  }
+  Serial.println(text);
+  return true;
 }
 
 void onEthFrame(const uint8_t *frame, uint16_t len) {
@@ -938,32 +1249,47 @@ void updateBeaconActive() {
   }
 }
 
+// Every QCA_REQUEST_INTERVAL_MS: GET_SW.REQ broadcast for the modem list.
 void sendRequests(uint32_t now) {
   uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
   qca.sendEthFrame(frame, homeplug::composeGetSwReq(frame, MY_MAC));
-  qca.sendEthFrame(frame, homeplug::composeNwInfoReq(frame, MY_MAC));
 
-  // backlog-0056: re-assert the sniffer's desired state every cycle (not only on transition) -
-  // VS_SNIFFER.REQ has no retry/ack of its own, so this is what makes a dropped frame self-heal,
-  // the same way GET_SW/NW_INFO above are re-sent unconditionally rather than only once.
-  bool shouldEnableSniffer = now - lastRealTrafficMs >= SNIFFER_IDLE_MS;
-  qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, shouldEnableSniffer));
-  if (shouldEnableSniffer != sniffer.enabled) {
-    sniffer.enabled = shouldEnableSniffer;
-    Serial.printf("Sniffer: %s (idle %lu ms)\n", shouldEnableSniffer ? "enabled" : "disabled",
-                  (unsigned long)(now - lastRealTrafficMs));
-    addLog(shouldEnableSniffer ? "** sniffer on" : "** sniffer off", ILI9341_YELLOW);
-    panelDirty = true;
-  }
-
-  // Forget modems and network info that stopped answering
+  // Forget modems that stopped answering
   if (modems.expire(now, QCA_MAX_AGE_MS)) {
     printModemTable();
   }
-  if (network.valid && now - network.receivedMs > QCA_MAX_AGE_MS) {
-    network.valid = false;
-  }
   panelDirty = true;  // counters changed
+}
+
+// Sends the sniffer's desired state: on while not joined (or join status unknown), off while
+// joined, always on after `sniff on`. Sent every status cycle, not only on a change -
+// VS_SNIFFER.REQ has no retry of its own, and a modem reset switches the sniffer off.
+void updateSnifferState() {
+  bool joined = network.valid && network.info.numNetworks > 0;
+  bool wanted = diag.snifferForced() || !joined;
+  uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
+  qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, wanted));
+  if (wanted != sniffer.enabled) {
+    sniffer.enabled = wanted;
+    Serial.printf("Sniffer: %s (%s)\n", wanted ? "enabled" : "disabled",
+                  diag.snifferForced() ? "forced" : joined ? "joined" : "not joined");
+    addLog(wanted ? "** sniffer on" : "** sniffer off", ILI9341_YELLOW);
+    panelDirty = true;
+  }
+}
+
+// Every QCA_STATUS_INTERVAL_MS: join status of the local modem, then the sniffer state.
+void sendStatusRequests(uint32_t now) {
+  static const uint8_t LOCAL_MODEM_MAC[6] = {0x04, 0x65, 0x65, 0xFF, 0xFF, 0x11};
+  uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
+  qca.sendEthFrame(frame, homeplug::composeVsNwInfoReq(frame, LOCAL_MODEM_MAC, MY_MAC));
+
+  if (network.valid && now - network.receivedMs > QCA_STATUS_MAX_AGE_MS) {
+    network.valid = false;
+    Serial.println("Network: unknown (no VS_NW_INFO answer)");
+    panelDirty = true;
+  }
+  updateSnifferState();
 }
 
 // ---- Arduino entry points ---------------------------------------------------
@@ -972,6 +1298,8 @@ void setup() {
   Serial.setRxBufferSize(4096);  // "wr" command lines
   Serial.setTxBufferSize(8192);  // bursts of frame log lines
   Serial.begin(SERIAL_BAUD);
+
+  pinMode(PAGE_BUTTON_PIN, INPUT_PULLUP);
 
   if (TFT_BL >= 0) {
     pinMode(TFT_BL, OUTPUT);
@@ -996,6 +1324,7 @@ void loop() {
   static uint32_t lastPoll = 0;
   static uint32_t lastCheck = millis();
   static uint32_t lastRequest = 0;
+  static uint32_t lastStatus = 0;
   static uint32_t lastPanelRefresh = 0;
   static uint64_t lastShown = UINT64_MAX;
 
@@ -1011,21 +1340,30 @@ void loop() {
   // Once per second, only while .INDs arrive and "log 1": how many were received beacons vs.
   // everything else - so the beacon display can be checked against the serial log.
   // loopmax = longest loop() pass in that second (the part of the beacon->TFT delay we control).
+  // dec/fail = V2G messages decoded / failed, err = SPI errors, rx = SPI frames, per second.
   static uint32_t lastSnifSummary = 0, lastInd = 0, lastBeacons = 0, loopMax = 0, prevLoopStart = now;
+  static uint32_t lastDec = 0, lastFail = 0, lastErr = 0, lastRx = 0;
   loopMax = max(loopMax, now - prevLoopStart);
   prevLoopStart = now;
   if (now - lastSnifSummary >= 1000) {
     lastSnifSummary = now;
     uint32_t ind = sniffer.indCount - lastInd, beacons = sniffer.beaconCount - lastBeacons;
-    if (ind && diag.logTraffic()) {
-      Serial.printf("SNIF %lu ind=%lu beacons=%lu other=%lu loopmax=%lums meter=%u..%u changes=%u\n",
+    uint32_t dec = v2gDisplay.decoded - lastDec, fail = v2gDisplay.failed - lastFail;
+    if ((ind || dec || fail) && diag.logTraffic()) {
+      Serial.printf("SNIF %lu ind=%lu beacons=%lu other=%lu dec=%lu fail=%lu rx=%lu err=%lu "
+                    "loopmax=%lums meter=%u..%u changes=%u\n",
                     (unsigned long)now, (unsigned long)ind, (unsigned long)beacons,
-                    (unsigned long)(ind - beacons), (unsigned long)loopMax,
-                    sniffer.levelMin == 255 ? 0 : sniffer.levelMin, sniffer.levelMax,
-                    sniffer.levelChanges);
+                    (unsigned long)(ind - beacons), (unsigned long)dec, (unsigned long)fail,
+                    (unsigned long)(qca.rxFrames() - lastRx), (unsigned long)(qca.errors() - lastErr),
+                    (unsigned long)loopMax, sniffer.levelMin == 255 ? 0 : sniffer.levelMin,
+                    sniffer.levelMax, sniffer.levelChanges);
     }
     lastInd = sniffer.indCount;
     lastBeacons = sniffer.beaconCount;
+    lastDec = v2gDisplay.decoded;
+    lastFail = v2gDisplay.failed;
+    lastErr = qca.errors();
+    lastRx = qca.rxFrames();
     loopMax = 0;
     sniffer.levelMin = 255;
     sniffer.levelMax = 0;
@@ -1038,11 +1376,15 @@ void loop() {
   }
 
   if (modem.present) {
-    if (modem.requestPending ||
-        (diag.periodicRequests() && now - lastRequest >= QCA_REQUEST_INTERVAL_MS)) {
-      modem.requestPending = false;
+    bool pending = modem.requestPending;  // modem (re)appeared: ask right away
+    modem.requestPending = false;
+    if (pending || (diag.periodicRequests() && now - lastRequest >= QCA_REQUEST_INTERVAL_MS)) {
       lastRequest = now;
       sendRequests(now);
+    }
+    if (pending || (diag.periodicRequests() && now - lastStatus >= QCA_STATUS_INTERVAL_MS)) {
+      lastStatus = now;
+      sendStatusRequests(now);
     }
     if (now - lastPoll >= QCA_POLL_INTERVAL_MS) {
       lastPoll = now;
@@ -1052,13 +1394,19 @@ void loop() {
   }
 
   updateBeaconActive();
+  pollPageButton(now);
 
   if (panelDirty) {
     panelDirty = false;
-    drawPanel();
+    drawHeaderHint();
+    if (page == 1) {
+      drawPanel();
+    } else {
+      drawPage2();
+    }
   }
 
-  if (logDirty && now - lastLogDraw >= LOG_DRAW_INTERVAL_MS) {
+  if (page == 1 && logDirty && now - lastLogDraw >= LOG_DRAW_INTERVAL_MS) {
     logDirty = false;
     lastLogDraw = now;
     drawLog();
