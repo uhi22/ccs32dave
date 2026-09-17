@@ -138,15 +138,6 @@ The chosen GPIOs are free on every ESP32-S3 module variant. The wiring avoids GP
 | SPI_CS      | GPIO 15      | `QCA_CS`      | Active low                     |
 | INT         | –            |               | Not connected; the sketch polls |
 
-### Page button
-
-| Button | ESP32-S3 pin | Sketch define | Notes |
-|--------|--------------|---------------|-------|
-| one side | GPIO 16 | `PAGE_BUTTON_PIN` | Internal pull-up; a press toggles main page / page 2 (30 ms debounce) |
-| other side | GND | | |
-
-GPIO 16 is free on every ESP32-S3 module variant (it is only a 32 kHz crystal pin if such a crystal is fitted, which the DevKitC-1 doesn't have). The BOOT button isn't used because it's hard to reach.
-
 #### QCA7005 notes
 
 - **SPI settings:** mode 3 (clock idle high) at 4 MHz. ccs32berta used 2 MHz; 4 MHz gives headroom for the sniffer stream and measured no SPI errors, while 8 MHz did (`QCA_SPI_FREQUENCY`).
@@ -166,6 +157,15 @@ GPIO 16 is free on every ESP32-S3 module variant (it is only a 32 kHz crystal pi
       04:65:65:FF:FF:FF MAC-QCA7005-1.1.0.730-04-20140815-CS
   ```
   At the start of each new charging session the local modem resets, and the signature reads `0000` for up to 1 s.
+
+### Page button
+
+| Button | ESP32-S3 pin | Sketch define | Notes |
+|--------|--------------|---------------|-------|
+| one side | GPIO 16 | `PAGE_BUTTON_PIN` | Internal pull-up; a press toggles main page / page 2 (30 ms debounce) |
+| other side | GND | | |
+
+GPIO 16 is free on every ESP32-S3 module variant (it is only a 32 kHz crystal pin if such a crystal is fitted, which the DevKitC-1 doesn't have). The BOOT button isn't used because it's hard to reach.
 
 ## Software
 
