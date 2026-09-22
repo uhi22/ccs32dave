@@ -120,6 +120,10 @@ void Diag::handleLine(char *line) {
     _logTraffic = atoi(a1) != 0;
     _io.printf("LOG %d\n", _logTraffic);
     return;
+  } else if (strcmp(cmd, "page") == 0 && a1) {
+    _pageRequest = (uint8_t)atoi(a1);  // the sketch validates it against its page count
+    _io.printf("PAGE %u\n", _pageRequest);
+    return;
   } else if (strcmp(cmd, "sniff") == 0 && a1 &&
              (strcmp(a1, "on") == 0 || strcmp(a1, "auto") == 0)) {
     _snifferForced = strcmp(a1, "on") == 0;
@@ -127,7 +131,7 @@ void Diag::handleLine(char *line) {
     return;
   } else {
     _io.println("HELP rd <addr> <len> | wr <addr> <hex> | nwi | pp | stat | qreset | bcast 0|1 | "
-                "log 0|1 | sniff on|auto");
+                "log 0|1 | sniff on|auto | page <n>");
     return;
   }
   _retries = 0;

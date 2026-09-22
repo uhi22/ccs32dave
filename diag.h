@@ -21,6 +21,8 @@
 //   log 0|1              LOG <0|1>     one "F ..." line per received frame
 //   sniff on|auto        SNIFF <on|auto>   test aid: keep the VS_SNIFFER stream on even while
 //                                      joined (auto = on only while not joined)
+//   page <n>             PAGE <n>      show that screen page - the board has one button and
+//                                      nine pages, so stepping to page 8 by hand is tedious
 //   help                 HELP ...
 // A command without answer from the modem ends with "<TAG> <addr> timeout".
 // Numbers may be given as hex (0x prefix) or decimal.
@@ -45,6 +47,14 @@ public:
   bool logTraffic() const { return _logTraffic; }
   bool snifferForced() const { return _snifferForced; }
 
+  // Page requested over the serial line, 0 = none. Reading it clears it: the sketch owns the
+  // page, this class only passes the wish on.
+  uint8_t takePageRequest() {
+    uint8_t p = _pageRequest;
+    _pageRequest = 0;
+    return p;
+  }
+
 private:
   enum class Kind : uint8_t { None, Read, Write, NwInfo, PingPongBlock, PingPongOwnTei };
 
@@ -67,6 +77,7 @@ private:
   uint32_t _sentMs = 0;
   uint8_t _ppBlock[0x40];
 
+  uint8_t _pageRequest = 0;
   bool _periodicRequests = true;
   bool _logTraffic = true;
   bool _snifferForced = false;

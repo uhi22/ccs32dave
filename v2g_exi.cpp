@@ -37,6 +37,11 @@ static float physicalValue(const struct dinPhysicalValueType &v) {
 static bool extractDinBody(const struct dinBodyType &body, V2gValues &out) {
   if (body.SessionSetupReq_isUsed) {
     strlcpy(out.msgName, "SessionSetupReq", sizeof(out.msgName));
+    // backlog_0017: the EVCCID is the car's MAC - the only place the session names the car.
+    const auto &id = body.SessionSetupReq.EVCCID;
+    out.evccidLen = id.bytesLen > sizeof(out.evccid) ? sizeof(out.evccid) : (uint8_t)id.bytesLen;
+    memcpy(out.evccid, id.bytes, out.evccidLen);
+    out.hasEvccid = out.evccidLen > 0;
     return true;
   }
   if (body.SessionSetupRes_isUsed) {
@@ -56,13 +61,49 @@ static bool extractDinBody(const struct dinBodyType &body, V2gValues &out) {
   NAMED(ContractAuthenticationReq)
   NAMED(ContractAuthenticationRes)
   if (body.ChargeParameterDiscoveryReq_isUsed) {
+    // backlog_0013: the car's own limits, shown on page 3.
     strlcpy(out.msgName, "ChargeParameterDiscoveryReq", sizeof(out.msgName));
+    const struct dinChargeParameterDiscoveryReqType &r = body.ChargeParameterDiscoveryReq;
+    out.hasCpdReq = true;
+    out.energyTransferMode = (uint8_t)r.EVRequestedEnergyTransferType;
+    if (r.DC_EVChargeParameter_isUsed) {
+      const struct dinDC_EVChargeParameterType &p = r.DC_EVChargeParameter;
+      out.hasEvLimits = true;
+      out.evMaxVoltage = physicalValue(p.EVMaximumVoltageLimit);
+      out.evMaxCurrent = physicalValue(p.EVMaximumCurrentLimit);
+      out.hasFullSoc = p.FullSOC_isUsed;
+      out.fullSoc = p.FullSOC;
+      out.hasBulkSoc = p.BulkSOC_isUsed;
+      out.bulkSoc = p.BulkSOC;
+      out.evReady = p.DC_EVStatus.EVReady != 0;
+      out.evErrorCode = (uint8_t)p.DC_EVStatus.EVErrorCode;
+      out.cpdSoc = p.DC_EVStatus.EVRESSSOC;
+      out.hasSoc = true;  // the main page's SoC is fed by every DC message that carries one
+      out.soc = p.DC_EVStatus.EVRESSSOC;
+    }
     return true;
   }
   if (body.ChargeParameterDiscoveryRes_isUsed) {
+    // backlog_0013: the charger's limits. While EVSEProcessing is "Ongoing" the charge
+    // parameter block may be missing entirely - then only the processing state is shown.
     strlcpy(out.msgName, "ChargeParameterDiscoveryRes", sizeof(out.msgName));
+    const struct dinChargeParameterDiscoveryResType &r = body.ChargeParameterDiscoveryRes;
     out.hasResponseCode = true;
-    out.responseCode = (uint8_t)body.ChargeParameterDiscoveryRes.ResponseCode;
+    out.responseCode = (uint8_t)r.ResponseCode;
+    out.hasCpdRes = true;
+    out.evseProcessing = (uint8_t)r.EVSEProcessing;
+    if (r.DC_EVSEChargeParameter_isUsed) {
+      const struct dinDC_EVSEChargeParameterType &p = r.DC_EVSEChargeParameter;
+      out.hasEvseLimits = true;
+      out.evseMaxVoltage = physicalValue(p.EVSEMaximumVoltageLimit);
+      out.evseMaxCurrent = physicalValue(p.EVSEMaximumCurrentLimit);
+      out.evseMinVoltage = physicalValue(p.EVSEMinimumVoltageLimit);
+      out.evseMinCurrent = physicalValue(p.EVSEMinimumCurrentLimit);
+      out.hasEvseMaxPower = p.EVSEMaximumPowerLimit_isUsed;
+      if (p.EVSEMaximumPowerLimit_isUsed) {
+        out.evseMaxPower = physicalValue(p.EVSEMaximumPowerLimit);
+      }
+    }
     return true;
   }
   if (body.PowerDeliveryReq_isUsed) {
@@ -167,6 +208,12 @@ static bool decodeDin(const uint8_t *data, uint16_t len, V2gValues &out) {
     strlcpy(out.msgName, "DIN (empty body)", sizeof(out.msgName));
     return false;
   }
+  // The header rides on every message, so it is taken after the body decoded cleanly.
+  const auto &sid = s_dinDoc.V2G_Message.Header.SessionID;
+  out.sessionIdLen = sid.bytesLen > sizeof(out.sessionId) ? sizeof(out.sessionId)
+                                                          : (uint8_t)sid.bytesLen;
+  memcpy(out.sessionId, sid.bytes, out.sessionIdLen);
+  out.hasSessionId = out.sessionIdLen > 0;
   return true;
 }
 

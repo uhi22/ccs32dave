@@ -110,6 +110,32 @@ uint16_t composeVsSnifferReq(uint8_t *frame, const uint8_t sourceMac[6], bool en
 // enabled - treat as a "beacon activity" heartbeat, not as a frame worth logging individually.
 constexpr uint16_t MMTYPE_VS_SNIFFER_IND = 0xA036;
 
+// CM_ATTEN_CHAR.IND (0x606C), backlog_0015: the attenuation the EVSE measured over the PEV's
+// CM_MNBC_SOUND bursts, per OFDM carrier group, in dB. Wire layout after the MME header:
+// APPLICATION_TYPE(1) SECURITY_TYPE(1) SOURCE_ADDRESS(6) RUN_ID(8) SOURCE_ID(17) RESP_ID(17)
+// NUM_SOUNDS(1) NUM_GROUPS(1) then NUM_GROUPS attenuation bytes - which is exactly the 129-byte
+// frame seen on the bench (19 + 110, NUM_GROUPS 58).
+constexpr uint8_t ATTEN_MAX_GROUPS = 64;
+struct AttenProfile {
+  uint8_t pevMac[6] = {};   // SOURCE_ADDRESS: the PEV whose sounds were measured
+  uint8_t numSounds = 0;    // sounds the EVSE actually received (10 expected)
+  uint8_t numGroups = 0;
+  uint8_t attenuation[ATTEN_MAX_GROUPS] = {};  // dB per group, higher = weaker coupling
+};
+bool parseAttenCharInd(const uint8_t *frame, uint16_t len, AttenProfile &out);
+
+// CM_SLAC_MATCH.CNF (0x607D), backlog_0017: names both sides and hands over the key material.
+// After the MME header: APPLICATION_TYPE(1) SECURITY_TYPE(1) MVFLength(2) PEV_ID(17) PEV_MAC(6)
+// EVSE_ID(17) EVSE_MAC(6) RunID(8) RSVD(8) NID(7) RSVD(1) NMK(16) - the 109-byte frame on the
+// bench (19 + 90).
+struct SlacMatch {
+  uint8_t pevMac[6] = {};
+  uint8_t evseMac[6] = {};
+  uint8_t nid[7] = {};
+  uint8_t nmk[16] = {};
+};
+bool parseSlacMatchCnf(const uint8_t *frame, uint16_t len, SlacMatch &out);
+
 // True if frame is a VS_SNIFFER.IND for a beacon the local modem RECEIVED. The stream also
 // reports every other delimiter, including the local modem's own transmissions (our periodic
 // broadcasts), which must not count as "a CCo is in sight". Wire layout, read off real records

@@ -16,6 +16,8 @@
 - **Beacon meter:** when not joined, shows whether a charger's modem (CCo) is in sight and how well its beacons are received.
 - **Stale values fade out:** V2G values that are no longer updated turn gray.
 - **Page 2 (push button):** SDP transport security (TLS or not) and the XML schemas offered by the car and selected by the charger. A red `TLS` in the header warns that the session is encrypted.
+- **Page 3 (push button):** the charge parameter discovery - the car's limits next to the charger's, so it is visible which side caps the session.
+- **Pages 4-9:** session timeline, SLAC attenuation profile, a live voltage/current chart, identity and keys (including the session's NID and NMK), the energy delivered, and a message ladder diagram.
 
 ## Description
 
@@ -32,11 +34,50 @@ The main screen shows:
 - Traffic and SPI counters
 - In the header: the uptime in seconds with **10 ms resolution**, refreshed every **50 ms** (20 Hz), and a red `TLS` once the charger's SDP response selected TLS (orange `TLS?` if only the car's request asked for it)
 
-A push button (see "Page button" below) switches to **page 2**, and back:
+A push button (see "Page button" below) cycles through the nine pages and back to the main page. Over the serial line, `page <n>` jumps straight to one.
+
+Page 2 is one page in two stacked parts, each with its own heading in the same format (yellow, size 2, same left edge) and a single separator line between them - no line under the top heading:
 
 - **SDP:** what the car requests (TLS / no TLS, TCP / UDP), what the charger answers (the same, plus its IPv6 address and TCP port). Green = no TLS, red = TLS.
-- **App handshake:** up to 5 schemas offered by the car (SchemaID, priority, version, namespace such as `urn:din:70121:2012:MsgDef`), the charger's response code and selected schema, marked with `>` and shown in large text (e.g. `-> DIN 70121`).
+- **schema** (the lower section's heading): up to 5 schemas offered by the car (SchemaID, priority, version, namespace such as `urn:din:70121:2012:MsgDef`), the charger's response code, and the selected one marked with `>` - the negotiated protocol is repeated at the bottom in size-3 digits (e.g. `-> DIN 70121`), since that is the page's conclusion.
 - The page stays coloured while the session is alive (any SDP or V2G message) and grays as a whole after 3 s without traffic. A SLAC match clears it, so values of the previous session can't reappear as current.
+- Page 2 has no `ccs32dave` and no uptime either. **Only the main page has the uptime box**; every other page uses the header band for a heading, and the `TLS` warning moves to the right edge in small text.
+
+Page 3 shows the **charge parameter discovery** in two columns - the car's request on the left (yellow, like the main page's TARGET block), the charger's response on the right (green, like PRESENT):
+
+- **Car** (`ChargeParameterDiscoveryReq`): requested energy transfer mode (e.g. `DC extended`), maximum voltage and current in size-3 digits, the SoC sent with the request, the `EVReady` flag, the optional `full` / `bulk` SoC targets and the DC error code (green `NO_ERROR`, otherwise red; the names are shortened to fit, the full DIN names are in the comment above `evErrorName()`).
+- **Charger** (`ChargeParameterDiscoveryRes`): `Ongoing` (orange) or `Finished` (green), maximum voltage, current and power in size-3 digits, the minimum voltage and current, and the response code.
+- Fields the message doesn't carry show `-`: the SoC targets and the maximum power are optional in DIN, and while the charger answers `Ongoing` it may leave out its whole parameter block.
+- Same session colouring as page 2 (gray after 3 s of quiet, cleared on a SLAC match).
+- The header belongs to the page: `ccs32dave` and the uptime box are replaced by the page name, and the `TLS` warning moves to the right edge in small text (with TLS there is no discovery data to show at all). Both come back on pages 1 and 2.
+
+Pages 4 to 9 each take one topic. Like page 3, they put their own name in the header in place of
+`ccs32dave` and the uptime, and they gray out together with pages 2 and 3 once the session has
+been quiet for 3 s:
+
+- **Page 4 - session timeline** (backlog_0014): one bar per phase (SLAC, join, SDP, handshake,
+  setup..CPD, CableCheck, PreCharge, CurrentDemand, stop) with its duration. Green = finished,
+  yellow = running, red = this is where the session stopped, grey = never reached. Bar length is
+  the phase's share of the longest one.
+- **Page 5 - SLAC quality** (backlog_0015): the attenuation profile from `CM_ATTEN_CHAR.IND`, one
+  bar per carrier group in dB (green below 30, yellow below 45, red above), plus the number of
+  sounds received, the SLAC duration and the average and worst attenuation. **On this bench the
+  profile is synthetic**: pyPLC has no measurements from the AR7420 and sends a constant 9 dB with
+  three rising values at the top end, so the curve does not move. Against a real charger it is a
+  fingerprint of the coupling.
+- **Page 6 - voltage and current** (backlog_0016): a sweeping plot of the present voltage (green,
+  left scale) and current (yellow, right scale) over the last 120 s, one sample per 400 ms. The
+  newest sample overwrites the oldest column, so the two-pixel gap shows where "now" is. Both
+  scales round up to a readable step on their own, and the current values stand above the plot.
+- **Page 7 - identity and keys** (backlog_0017): the car (EVCCID, or the PEV MAC from the SLAC
+  match), the charger's MAC, the V2G SessionID, and the NID and NMK the session runs on. The
+  payment option was dropped as uninteresting (owner decision 2026-09-22).
+- **Page 8 - energy** (backlog_0020): energy in kWh and charge in Ah integrated over the present
+  values, average and peak power, how long current actually flowed, and the phase reached.
+- **Page 9 - message ladder** (backlog_0021): car on the left rail, charger on the right, one
+  arrow per exchange with an arrowhead per direction. Repeats of the same exchange collapse into
+  one row with a count (`CurrentDemand x176` with a two-way arrow), so a charge loop doesn't push
+  the session start off the page.
 
 ```
 +-------------------------------------------------------+
@@ -59,6 +100,28 @@ A push button (see "Page button" below) switches to **page 2**, and back:
 |                                     | OK         (grn) |
 |---------------------------------------------------------
 | MME 42 IPv6 800  SPI TX 24 RX 1900 err 0 AA55  (grey)  |
++-------------------------------------------------------+
+```
+
+Page 3 (charge parameter discovery) - the page name replaces `ccs32dave` and the uptime box in
+the header here, so the values can use the whole screen:
+
+```
++-------------------------------------------------------+
+| ChargeParameterDiscovery       (yellow, size 2)  [TLS] |
+|---------------------------------------------------------
+| CAR wants          (grey) | CHARGER          (grey)    |
+| DC extended      (size 2) | Finished     (size 2, grn) |
+| maximum             (grey)| maximum             (grey) |
+| 410.0V   (yellow, size 3) | 450.0V     (green, size 3) |
+| 125.0A   (yellow, size 3) | 200.0A     (green, size 3) |
+| SoC 0%     (cyan, size 2) | 10.0kW     (green, size 3) |
+| ready no (orange, size 2) | minimum             (grey) |
+| full 100%  bulk 80%       | 200V 1A          (size 2)  |
+| EV error code       (grey)| response            (grey) |
+| NO_ERROR  (green, size 2) | OK         (green, size 2) |
+|---------------------------------------------------------
+| button: main page                               (grey) |
 +-------------------------------------------------------+
 ```
 
@@ -156,7 +219,7 @@ The chosen GPIOs are free on every ESP32-S3 module variant. The wiring avoids GP
 
 | Button | ESP32-S3 pin | Sketch define | Notes |
 |--------|--------------|---------------|-------|
-| one side | GPIO 16 | `PAGE_BUTTON_PIN` | Internal pull-up; a press toggles main page / page 2 (30 ms debounce) |
+| one side | GPIO 16 | `PAGE_BUTTON_PIN` | Internal pull-up; a press steps to the next of the nine pages and wraps to the main page (30 ms debounce). `page <n>` on the serial line jumps directly |
 | other side | GND | | |
 
 GPIO 16 is free on every ESP32-S3 module variant (it is only a 32 kHz crystal pin if such a crystal is fitted, which the DevKitC-1 doesn't have). The BOOT button isn't used because it's hard to reach.
@@ -275,7 +338,7 @@ labels, and does the first modem check.
 | every pass | `pollPageButton()`: on a debounced press, `showPage()` clears everything below the header and redraws the other page |
 | 50 ms | Uptime display |
 | on change, and every 500 ms | `drawHeaderHint()` (`TLS`), then `drawPanel()` (main page) or `drawPage2()`: redraws only the text lines whose content or color changed (the 500 ms tick lets stale values fade) |
-| on change, max. every 200 ms | `drawLog()`: redraws the frame log (main page only; entries are still collected on page 2) |
+| on change, max. every 200 ms | `drawLog()`: redraws the frame log (main page only; entries are still collected on pages 2 and 3) |
 
 `onEthFrame()` first offers the frame to `diag` (answers to a pending serial command are consumed
 there, not shown as traffic), then sorts the rest:
@@ -308,7 +371,7 @@ printed, independent of that setting (same convention: print on change, not on e
   errors.
 - **`homeplug`:** builds `GET_SW.REQ` (Qualcomm vendor MME `0xA000`, OUI `00:B0:52`) and `CM_NW_INFO.REQ` (`0x6038`, MMV 1), plus the vendor MMEs `VS_RD_MEM`/`VS_WR_MEM`/`VS_NW_INFO` (`0xA008`/`0xA004`/`0xA038`) used by `diag` to talk to a specially patched local modem over SPI instead of Ethernet, and `VS_SNIFFER.REQ` (`0xA034`, stock firmware) with a check for received beacon indications. It parses the matching `.CNF`s, and turns MMTYPEs into readable names.
 - **`modem_list`:** table of up to 3 modems, keyed by MAC, with the local modem always first. Entries expire when a modem stops answering.
-- **`diag`:** serial command interface, including `sniff on|auto` (see its own header for the full list) - the diagnosis
+- **`diag`:** serial command interface, including `sniff on|auto` and `page <n>` (see its own header for the full list) - the diagnosis
   channel for a modem that has no other host link (no JTAG, no Ethernet to the QCA on this board).
 - **`v2gtp`:** TCP reassembly + V2GTP message framing, keyed by source MAC, without a TCP stack.
 - **`v2g_exi`:** decodes one complete EXI payload (DIN 70121, or the app-handshake) using the ported

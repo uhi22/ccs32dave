@@ -275,3 +275,213 @@ charging phase each: 4 MHz captured 458 of ~486 messages (94%) with 0 SPI errors
 loop; 8 MHz 91% with 5 errors; 2 MHz no errors either. 4 MHz gives headroom for the sniffer stream
 (~19 kB/s) without the 8 MHz errors, so 4 MHz it is. The worst-case loop time comes from drawing
 and serial output, not from the SPI clock.
+
+## backlog_0013: page3 - charge parameter discovery
+
+**Status:** implemented, and run on the bench 2026-09-22 (pyPLC EVSE loop + Foccci PEV).
+
+A third page, reached with the same button (main -> page 2 -> page 3 -> main), shows what
+`ChargeParameterDiscoveryReq` and `-Res` negotiate. Two columns, so the limiting side is visible
+without arithmetic: the car's request left (yellow, like the main page's TARGET block), the
+charger's response right (green, like PRESENT).
+
+Fields chosen by the owner 2026-09-22:
+
+- Car: requested energy transfer mode, `EVMaximumVoltageLimit` / `EVMaximumCurrentLimit`,
+  `FullSOC` / `BulkSOC`, and the request's `DC_EVStatus` (`EVReady`, `EVErrorCode`, `EVRESSSOC`).
+- Charger: `EVSEProcessing` plus the response code, `EVSEMaximum` voltage / current / power, and
+  `EVSEMinimum` voltage / current.
+- Deliberately left out: the car's max power and energy request/capacity, peak current ripple and
+  current regulation tolerance, `EVSEEnergyToBeDelivered`, the `DC_EVSEStatus` detail
+  (status code, isolation status, notification) and the `SAScheduleList` PMax schedule. The
+  remaining lines on the page are free for those if a bench run shows they're wanted.
+
+Everything optional in DIN (`FullSOC`, `BulkSOC`, `EVSEMaximumPowerLimit`) shows `-` when the
+message omits it, and the charger's whole parameter block may be missing while it still answers
+`Ongoing` - then only the processing state and response code are shown.
+
+The values live in `SessionSetup` alongside the SDP and handshake data, so they inherit its
+lifetime: cleared on the SLAC match, grayed as a whole after 3 s of V2G silence. That timer and
+its helpers lost their "page2" name (`SESSION_QUIET_MS`, `sessionQuiet()`, `sessionColor()`),
+since page 3 uses them too.
+
+**Bench run 2026-09-22** (`run_evse_loop.sh`, `SESSION_S=40`, Foccci as PEV): the values on page 3
+matched an independent decode of the same session - the car's own request as pyPLC logged it, and
+the charger's 63-byte response re-decoded through pyPLC's `exiConnector`:
+
+| | car (Foccci) | charger (pyPLC) |
+|---|---|---|
+| mode | `DC extended` (type 3) | - |
+| maximum | 410.0 V / 125.0 A | 450.0 V / 200.0 A / 10.0 kW |
+| minimum | - | 200 V / 1 A |
+| SoC | 0 % (the Foccci reports no real SoC, see backlog_0051) | - |
+| targets | full 100 %, bulk 80 % | - |
+| status | `EVReady` 0 -> `ready no`, `NO_ERROR` | `Finished`, response `OK` |
+
+**Layout revised after that run** (owner request): the page name moved into the header, replacing
+`ccs32dave` and the uptime box on this page only (`drawMainHeader()` / `drawPage3Header()`, and
+the uptime is skipped while page 3 is up). The freed rows let the six numbers that matter run at
+text size 3 and the rest at size 2. Two consequences: the `TLS` hint moved to the right edge of
+the heading in size 1 (it must stay visible - with TLS there is no discovery data at all), and the
+DC error names were shortened to the 12 characters a size-2 column holds.
+
+## backlog_0014: page4 - session timeline
+
+**Status:** implemented and run on the bench 2026-09-22.
+
+Every frame the ESP32 receives already carries a millisecond timestamp, so the phases of a session
+and their durations can be shown as bars: SLAC, network join, SDP, app handshake, setup..CPD,
+CableCheck, PreCharge, CurrentDemand, stop. The running phase is highlighted, a phase that stopped
+without its successor turns red. Measured on the bench 2026-09-22: SLAC takes 1.4 s from
+`CM_SLAC_PARAM.REQ` to `CM_SLAC_MATCH.CNF`.
+
+Why it earns a page: it answers "where did the session stop, and what took so long" directly,
+instead of leaving it to be inferred from the last message name. With the 40 s `run_evse_loop.sh`
+cycle most sessions are cut in CableCheck - the timeline says so at a glance.
+
+## backlog_0015: page5 - SLAC attenuation profile
+
+**Status:** implemented and verified on the bench 2026-09-22, but see the caveat at the end.
+
+`CM_ATTEN_CHAR.IND` (MMTYPE 0x606C) carries the attenuation the EVSE measured over the 10
+`CM_MNBC_SOUND.IND` bursts, per OFDM carrier group, in dB. Observed on the bench: 129 bytes total,
+which is exactly the 19-byte MME header plus APPLICATION_TYPE(1) SECURITY_TYPE(1)
+SOURCE_ADDRESS(6) RUN_ID(8) SOURCE_ID(17) RESP_ID(17) NUM_SOUNDS(1) NUM_GROUPS(1) and 58 group
+bytes - so NumGroups = 58 on this bench.
+
+Drawn as a bar graph it is a fingerprint of the RF coupling: it changes shape when a cable or
+coupler is moved. Plus the sound count (10/10 seen), the SLAC duration and the average
+attenuation. This is the only view of the physical layer the project would have - the beacon
+meter on page 1 is a crude proxy by comparison.
+
+## backlog_0016: page6 - live V/I chart
+
+**Status:** implemented and run on the bench 2026-09-22.
+
+Two traces, present voltage and present current, over the last couple of minutes, drawn as a
+sweeping (ECG-style) plot so no full-screen redraw is needed. Shows the shape of the session -
+the precharge ramp, the current ramp, the CC->CV knee - which the numeric panel never conveys.
+The data rate is there: 87 `CurrentDemandRes` in a 50 s bench capture, and much faster on a real
+charger.
+
+## backlog_0017: page7 - identity and keys
+
+**Status:** implemented and verified byte-for-byte on the bench 2026-09-22.
+
+One page for "who is talking to whom, under which keys": EVCCID (the car's MAC, e.g.
+`02:34:28:88:10:57`), the EVSE's MAC, the V2G SessionID (assigned by the charger in
+`SessionSetupRes`; the request carries all zeroes), and the NID + NMK of the PLC network. The
+schema and version stay on page 2, and the EVSE's IPv6 address and port stay in its SDP block.
+
+The payment option and selected service were implemented, then **removed again on 2026-09-22**
+(owner: not of interest). The decoding went with them, so bringing them back means re-adding the
+`ServicePaymentSelectionReq` extraction in `v2g_exi.cpp` - it is three fields.
+
+`CM_SLAC_MATCH.CNF` (observed: 109 bytes = 19 header + APPLICATION_TYPE(1) SECURITY_TYPE(1)
+MVFLength(2) PEV_ID(17) PEV_MAC(6) EVSE_ID(17) EVSE_MAC(6) RunID(8) RSVD(8) NID(7) RSVD(1)
+NMK(16)) carries both MACs, the NID and the NMK in one frame. For the qca7000-transparency work
+next door that key material is the interesting part; a SessionID that changes per cycle also
+proves sessions aren't being resumed.
+
+## backlog_0018: protocol timing / latency page
+
+**Status:** proposed 2026-09-22, NOT implemented (owner selected 0014-0017, 0020, 0021 first).
+
+Request-to-response round-trip per message type (min / average / maximum) and the period of the
+CurrentDemand loop. DIN and ISO 15118 both have real timeouts, so this would catch a sluggish
+charger or a retrying car before it turns into a failed session. Retries are already visible on
+the wire (the bench capture shows 3x `CM_START_ATTEN_CHAR.IND` and 3x SDP request).
+
+## backlog_0019: session history / soak-test table
+
+**Status:** proposed 2026-09-22, NOT implemented (owner selected 0014-0017, 0020, 0021 first).
+
+The last ~8 sessions as rows: start, phase reached, duration, whether SLAC completed, maximum
+power, end reason. With the 40 s session loop this turns the display into a regression view
+("6 of 8 reached CurrentDemand") that no single-session page can give. Would need the per-session
+summary to survive the SLAC-match clear that resets the other pages.
+
+## backlog_0020: page8 - energy receipt
+
+**Status:** implemented and run on the bench 2026-09-22.
+
+Integrate the present voltage x present current over the session: energy in kWh, charge in Ah,
+average and peak power, and the session duration. The "what did this session actually deliver"
+summary, computed from the `CurrentDemandRes` stream the decoder already produces.
+
+## backlog_0021: page9 - ladder diagram
+
+**Status:** implemented and run on the bench 2026-09-22.
+
+A sequence diagram: the car on one rail, the charger on the other, one arrow per message with its
+name, scrolling as the session runs. Direction and order at a glance - page 1's frame log is a
+flat list that doesn't show who spoke. Direction comes from the message suffix (`...Req` = car,
+`...Res` = charger) for V2G, and from the source MAC for the SLAC frames.
+
+## backlog_0022: what the six new pages cost, and how they were checked
+
+**Status:** notes on the 2026-09-22 implementation of backlog_0014..0017, 0020, 0021.
+
+**Session data.** Everything the new pages show belongs to one session and is reset together in
+`beginSession()`, called from the same SLAC-match branch that already cleared `SessionSetup`. Two
+things happen *before* that point and would be wiped by it, so they wait outside the session
+struct and are copied in: the start of the SLAC run (`slacStartMs`, from the first
+`CM_SLAC_PARAM.REQ` that is not a retry) and the attenuation profile - `CM_ATTEN_CHAR.IND`
+arrives about a second before the match.
+
+**Two new wire parsers** in `homeplug.cpp`, both verified against pyPLC's own values:
+
+- `parseAttenCharInd()` (`CM_ATTEN_CHAR.IND`, 0x606E). pyPLC sends 58 groups, 10 sounds, every
+  group 9 dB except the last three (0x0F, 0x13, 0x19). The ESP32 read `sounds 10 groups 58 avg 9
+  max 25 dB` - the average of that profile is 9.55 and the worst group is the final byte, so the
+  offsets are right to the last byte of the frame.
+- `parseSlacMatchCnf()` (`CM_SLAC_MATCH.CNF`, 0x607D). Two consecutive sessions matched the RPi's
+  log exactly: `nid 0102C352ACFD07 nmk 777702F877..` / `nid 0102F39550A707 nmk 77771D3777..`
+  against pyPLC's `01 02 C3 52 AC FD 07` / `77 77 02 F8 77 ..` and `01 02 F3 95 50 A7 07` /
+  `77 77 1D 37 77 ..`. pyPLC randomises only bytes 2 and 3 of an otherwise all-0x77 NMK
+  (`runEvseSlacHandler`), which is exactly the pattern that came out.
+
+**Caveat for page 5:** on this bench the attenuation profile is **simulated, not measured** -
+pyPLC has no values from the AR7420 and fills a constant 9 dB plus three rising values
+(`composeAttenChar`). The page will therefore show the same flat curve in every session here. It
+only becomes the coupling fingerprint the page was built for against a real charger.
+
+**Drawing cost.** The pages that draw graphics cache what is already on the screen and repaint
+only the difference: page 4 keeps each bar's last width, page 5 a key over the profile, page 6
+draws one column per new sample (sweep, not scroll), page 9 redraws at most at 5 Hz and only when
+the ladder actually changed. Pages 4 and 6 also need a 200 ms tick of their own, because a running
+phase grows and the sweep advances even when no frame arrives.
+
+**Navigation.** Nine pages on one button is tedious, so `diag` gained `page <n>` (answer
+`PAGE <n>`), which jumps straight to a page over the serial line. It was how the pages were
+stepped through during the bench run.
+
+**Measured cost** of all six pages together: flash 414 kB -> 428 kB (32 % of 1.3 MB), globals
+69 kB -> 77 kB (23 % of 320 kB). A 95 s run over two sessions produced 0 decode errors and no
+resets.
+
+## backlog_0023: page layout revision after the first nine-page bench run
+
+**Status:** done 2026-09-22.
+
+Three owner observations after looking at the pages on the bench:
+
+- **A black rectangle sat in the middle of every heading.** The TLS hint (`headerHintLine`) is a
+  four-character field at x=126 in the header, which is fine next to `ccs32dave` on the main page
+  but blanks four characters out of a page's own heading. Only page 3 had been moved to the hint
+  line at the right edge; pages 4-9 inherited the main page's. Now the rule is by page: the main
+  page uses `headerHintLine`, **everything with a heading uses `titleHintLine`** (renamed from
+  `p3HintLine`, since it is no longer page 3's).
+- **Page 2 became one page in two stacked parts.** `ccs32dave` and the uptime are gone there. Its
+  two headings, `SDP` and `schema`, are drawn alike - same yellow, same size 2, same left edge -
+  and the top one deliberately is NOT the usual page title: page 2 has its own header function
+  (`drawPage2Header()`) which puts the first part's heading where a title would go and leaves out
+  the line under the header, so the only rule on the page is the separator between its two parts
+  (owner request 2026-09-22, refined after a first version that kept the title styling). Note the
+  `HEADER_LINE_Y + 1` in its fillRect: the clear has to take the header line's own row with it,
+  or the line survives a switch from another page. The two rows this freed went into the text -
+  the SDP lines moved up and the negotiated protocol is now size 3. Only the main page still has
+  the uptime box.
+- **The payment option left page 7** (see backlog_0017), which freed a row. The NMK halves now get
+  one row each - side by side the second half started at x=170 with 16 size-2 characters, i.e.
+  42 px past the right edge, so it had been clipped since it was written.

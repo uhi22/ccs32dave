@@ -7,6 +7,7 @@ static constexpr uint16_t MMTYPE_NW_INFO = 0x6038;
 
 static constexpr uint16_t MMTYPE_REQ = 0x0000;
 static constexpr uint16_t MMTYPE_CNF = 0x0001;
+static constexpr uint16_t MMTYPE_IND = 0x0002;
 
 static const uint8_t MAC_BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const uint8_t QUALCOMM_OUI[3] = {0x00, 0xB0, 0x52};
@@ -254,6 +255,55 @@ bool parseVsNwInfoCnf(const uint8_t *frame, uint16_t len, VsNetworkInfo &out) {
     out.stations[out.numStations].tei = frame[pos + 6];
     out.numStations++;
   }
+  return true;
+}
+
+// SLAC payload parsers (backlog_0015 / 0017). Both messages are broadcast or unicast on the
+// CP line and reach us through the normal receive path - no request of ours is involved.
+static constexpr uint16_t MMTYPE_ATTEN_CHAR = 0x606C;
+static constexpr uint16_t MMTYPE_SLAC_MATCH = 0x607C;
+
+bool parseAttenCharInd(const uint8_t *frame, uint16_t len, AttenProfile &out) {
+  if (len < 24 || etherType(frame) != ETHERTYPE_HOMEPLUG ||
+      mmtype(frame) != (MMTYPE_ATTEN_CHAR | MMTYPE_IND)) {
+    return false;
+  }
+  uint8_t ofs = payloadOffset(frame);
+  const uint16_t groupsOfs = ofs + 1 + 1 + 6 + 8 + 17 + 17 + 1 + 1;  // see the header comment
+  if (groupsOfs > len) {
+    return false;
+  }
+  out = AttenProfile();
+  memcpy(out.pevMac, &frame[ofs + 2], 6);
+  out.numSounds = frame[groupsOfs - 2];
+  uint8_t groups = frame[groupsOfs - 1];
+  if (groups > ATTEN_MAX_GROUPS) groups = ATTEN_MAX_GROUPS;
+  if (groupsOfs + groups > len) {
+    groups = (uint8_t)(len - groupsOfs);  // truncated frame: keep what is there
+  }
+  out.numGroups = groups;
+  memcpy(out.attenuation, &frame[groupsOfs], groups);
+  return groups > 0;
+}
+
+bool parseSlacMatchCnf(const uint8_t *frame, uint16_t len, SlacMatch &out) {
+  if (etherType(frame) != ETHERTYPE_HOMEPLUG ||
+      mmtype(frame) != (MMTYPE_SLAC_MATCH | MMTYPE_CNF)) {
+    return false;
+  }
+  uint8_t ofs = payloadOffset(frame);
+  const uint16_t pevMacOfs = ofs + 1 + 1 + 2 + 17;
+  const uint16_t evseMacOfs = pevMacOfs + 6 + 17;
+  const uint16_t nidOfs = evseMacOfs + 6 + 8 + 8;
+  const uint16_t nmkOfs = nidOfs + 7 + 1;
+  if (nmkOfs + 16 > len) {
+    return false;
+  }
+  out = SlacMatch();
+  memcpy(out.pevMac, &frame[pevMacOfs], 6);
+  memcpy(out.evseMac, &frame[evseMacOfs], 6);
+  memcpy(out.nid, &frame[nidOfs], 7);
+  memcpy(out.nmk, &frame[nmkOfs], 16);
   return true;
 }
 
