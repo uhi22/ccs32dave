@@ -143,6 +143,8 @@ v2gtp.h/.cpp                                 TCP reassembly + V2GTP framing (no 
 v2g_exi.h/.cpp                               DIN 70121 / app-handshake EXI decode glue
 src/exi/                                     OpenV2G EXI codec (decoder-only), ported from
                                               ccs32berta - see backlog.md backlog_0001 step 2
+qca-modem-firmware/                          script that builds the modem's sniffer firmware
+                                              (see "QCA7005 sniffer firmware")
 ```
 
 The sketch folder is the repository root. Arduino requires the `.ino` file to have the same name as its folder.
@@ -214,6 +216,40 @@ The chosen GPIOs are free on every ESP32-S3 module variant. The wiring avoids GP
       04:65:65:FF:FF:FF MAC-QCA7005-1.1.0.730-04-20140815-CS
   ```
   At the start of each new charging session the local modem resets, and the signature reads `0000` for up to 1 s.
+
+#### QCA7005 sniffer firmware
+
+The local modem needs the special sniffer firmware `PINGPONG-RELEASE-5`. This repository doesn't
+contain that firmware, because it is based on the modem vendor's firmware. Instead,
+`qca-modem-firmware/make_pingpong_release_5.py` builds the image from an original flash image
+that you obtain yourself:
+
+1. The input is an original 2 MB SPI flash image with the QCA7005 firmware
+   `MAC-QCA7005-1.1.0.730-04-20140815-CS`. Apart from the per-device parameter blocks (PIB:
+   MAC address, keys), it must be identical to the image this release was tested with. The
+   script checks this and refuses anything else. Your image's own keys are kept. The file name
+   doesn't matter; the default is `original_1.1.0.730-04-CS-20140815.bin`.
+2. Build the image (only Python 3 is needed):
+   ```
+   python qca-modem-firmware/make_pingpong_release_5.py original_1.1.0.730-04-CS-20140815.bin
+   ```
+   This writes `qca_flash_PINGPONG-RELEASE-5.bin` with the MAC `04:65:65:FF:FF:11`. Use
+   `--mac` for a different one. The MAC must differ from every other modem on the line. The input
+   dump uses `04:65:65:FF:FF:FF`, like many other boards (e.g. Foccci).
+3. Write the image to the QCA7005's SPI flash with any SPI flash programmer. One way is a
+   Raspberry Pi with `flashrom`, with the QCA7005 held in reset while flashing. **Read a backup
+   of the original flash first.**
+
+The modem only boots a compressed firmware of exactly the right size, so the script checks that
+its result is bit-identical to the build tested on hardware. If it isn't, the script stops and
+writes nothing. It was tested on Windows 10 x64 with Python 3.11.7, Ubuntu 24.04 (WSL) with
+Python 3.12.3 and Raspbian 11 (armv7l) with Python 3.9.2.
+
+**Disclaimer, use at your own risk, no warranty:** flashing can leave the modem unusable until
+it is flashed again with a working image. The sniffer firmware joins the network of any charging
+session it observes and forwards that session's traffic. Use it only on your own equipment or
+where you are allowed to, and be aware that an extra station in the network can affect the
+charging session.
 
 ### Page button
 
