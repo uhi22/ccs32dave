@@ -6,7 +6,8 @@
 
 ## News
 
-- **Works in a real-world charging session:** sniffing tested successfully on a Hyundai Ioniq
+- Milestone reached: also for the AR7420 we have now a transparent sniffer software, see [pyPLC](https://github.com/uhi22/pyPLC#2026-10-09-ar7420-full-transparency-sniffer)
+- **ccs32dave works in a real-world charging session:** sniffing tested successfully on a Hyundai Ioniq
   charging at an Alpitronic HYC300. See the [video on YouTube](https://www.youtube.com/watch?v=CvkjcjtfIfo).
 - **Live DIN 70121 decode**, both directions: target/present voltage and
   current, SoC and the last message name and response code, updating in real time on the TFT.
