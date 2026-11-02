@@ -485,3 +485,50 @@ Three owner observations after looking at the pages on the bench:
 - **The payment option left page 7** (see backlog_0017), which freed a row. The NMK halves now get
   one row each - side by side the second half started at x=170 with 16 size-2 characters, i.e.
   42 px past the right edge, so it had been clipped since it was written.
+
+## backlog_0024: run on the v7014 unjoined in-modem-decrypt firmware (qca7000-transparency backlog-0199)
+
+The local modem is moving from PINGPONG-RELEASE-5 (joins the AVLN and forwards) to v7014
+(`261102-V7014-0730`), the unjoined in-modem-decrypt sniffer: it never joins, decrypts the
+overheard V2G in-modem, and ships it to the host as native 0x86DD. The V2G decode path is
+unchanged (both deliver decrypted 0x86DD over SPI; both directions confirmed). What changes is
+the modem panel and the beacon source.
+
+**Done (compiles, not yet verified on the TFT):**
+- `homeplug::parseStatusFrame()` + `StatusFrame`: decode the modem's own 250 ms status frame
+  (0x88E1, MMTYPE 0x0000, payload "STAT" + 32-bit LE words; LAYOUT_VER 7). Carries SEQ/UPTIME,
+  the NEK-capture counters (SEEN/CNFCNT/OKCNT), DROPCNT and the delimiter counts BEACON/SOF/SACK.
+- `handleStatusFrame()` + `StatusState status`: routed from `onHomeplugFrame`/`splashHandleFrame`.
+  The beacon meter is driven from the delta of the cumulative BEACON counter between successive
+  status frames (grey + empty when none arrived within `STATUS_FRAME_MAX_AGE_MS`).
+- Panel: the join line ("joined/not joined/role") is gone; the network line is permanently the
+  beacon meter. The "** joined/not joined" frame-log line is removed.
+- VS_SNIFFER.IND is no longer enabled automatically (splash enable removed; `updateSnifferState`
+  only sends enable when `sniff on` forces it as a raw diagnostic). The v7014 modem boots with the
+  sniffer off, so by default Dave never starts that stream.
+
+**Update (flashed to the ESP32-S3, COM11):** VS_NW_INFO.REQ poll removed entirely (NetworkStatus struct + the
+handler gone); the counter line now shows SOF and SACK from the status frame (signature hex dropped for room).
+Compiles + uploads clean; not yet watched on the TFT against a v7014 modem (the QCA on Dave still runs old
+firmware, so beacon meter/SOF/SACK read empty/0 until it is reflashed to v7014).
+
+**Still to do:**
+- Verify on the TFT against a live v7014 bench (beacon meter fills with a CCo in sight, empty when
+  not; the splash shows the v7014 version; no stale join text).
+- Decide whether to drop the VS_NW_INFO.REQ poll entirely (its result no longer drives the UI) and
+  whether to repurpose the freed modem-panel space (e.g. show SEEN/OKCNT or SOF/SACK from the
+  status frame).
+- Per-station SOF breakdown is a separate modem-side follow-up (qca7000-transparency backlog-0200).
+- README + News brought in line with V7014 (unjoined decrypt, status-frame beacon meter, no join/
+  VS_SNIFFER); the PINGPONG build instructions now point at make_v7014_release.py, with PINGPONG noted as
+  living in the git history. HEAD is one consistent ESP32 + QCA-V7014 pair; the previous commit is the
+  PINGPONG pair (identified by its commit hash, no tag).
+
+## backlog_0025: public V7014 modem-firmware release script
+
+`qca-modem-firmware/make_v7014_release.py` (sibling of `make_pingpong_release_5.py`): reproduces the V7014
+unjoined in-modem-decrypt firmware from the user's own stock QCA7005 1.1.0.730 dump, shipping no original firmware
+bytes (PIB-masked input check + an embedded diff of only the changed bytes, recompressed on the user's machine,
+strict size/hash gate). stdlib-only. Verified end-to-end: its firmware partitions are byte-identical to the image
+flashed and GET_SW-verified on the bench (261102-V7014-0730). The stray 2 MB dut_flash_PINGPONG-RELEASE-5.bin was
+removed from qca-modem-firmware/ (it contained original firmware).

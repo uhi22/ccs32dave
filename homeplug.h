@@ -136,6 +136,25 @@ struct SlacMatch {
 };
 bool parseSlacMatchCnf(const uint8_t *frame, uint16_t len, SlacMatch &out);
 
+// The QCA-DUT's own 250 ms status frame (v7001+; EtherType 0x88E1, MMTYPE 0x0000, payload begins
+// with the ASCII magic "STAT"). It is the telemetry channel for the unjoined in-modem-decrypt
+// firmware (v7014): little-endian 32-bit words from wire byte 17. BEACON/SOF/SACK are cumulative
+// RX delimiter counts (take the delta between two frames for a rate). LAYOUT_VER 7 fields:
+struct StatusFrame {
+  uint8_t layoutVer;  // w1
+  uint32_t seq;       // w2, ++ per frame (0 at a cold boot)
+  uint32_t uptime;    // w3, raw 25 MHz counter
+  uint32_t seen;      // w4, 0x6006 frames seen by the NEK capture
+  uint32_t cnfcnt;    // w5, 0x6006 recognised as GET_KEY.CNF
+  uint32_t okcnt;     // w6, NEKs committed
+  uint32_t multicnt;  // w7
+  uint32_t dropcnt;   // w8, ship: payloads dropped
+  uint32_t beacon;    // w9,  received beacons (delimiter FC&7 == 0)
+  uint32_t sof;       // w10, received SOFs  (FC&7 == 1)
+  uint32_t sack;      // w11, received SACKs (FC&7 == 2)
+};
+bool parseStatusFrame(const uint8_t *frame, uint16_t len, StatusFrame &out);
+
 // True if frame is a VS_SNIFFER.IND for a beacon the local modem RECEIVED. The stream also
 // reports every other delimiter, including the local modem's own transmissions (our periodic
 // broadcasts), which must not count as "a CCo is in sight". Wire layout, read off real records

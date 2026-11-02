@@ -307,6 +307,25 @@ bool parseSlacMatchCnf(const uint8_t *frame, uint16_t len, SlacMatch &out) {
   return true;
 }
 
+// The QCA-DUT status frame: MMTYPE 0x0000, payload "STAT" + 32-bit LE words from wire byte 17.
+bool parseStatusFrame(const uint8_t *frame, uint16_t len, StatusFrame &out) {
+  static constexpr uint8_t OFS_STATUS = 17;   // payload start (fo+0x31 -> wire byte 17)
+  static constexpr uint8_t STATUS_WORDS = 12; // w0..w11 (LAYOUT_VER 7) = 48 bytes
+  if (len < OFS_STATUS + STATUS_WORDS * 4 || etherType(frame) != ETHERTYPE_HOMEPLUG ||
+      mmtype(frame) != 0x0000 || memcmp(&frame[OFS_STATUS], "STAT", 4) != 0) {
+    return false;
+  }
+  auto w = [&](uint8_t i) -> uint32_t {
+    const uint8_t *p = &frame[OFS_STATUS + i * 4];
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  };
+  out.layoutVer = (uint8_t)w(1);
+  out.seq = w(2);  out.uptime = w(3);  out.seen = w(4);  out.cnfcnt = w(5);
+  out.okcnt = w(6);  out.multicnt = w(7);  out.dropcnt = w(8);
+  out.beacon = w(9);  out.sof = w(10);  out.sack = w(11);
+  return true;
+}
+
 static constexpr uint16_t MMTYPE_VS_SNIFFER = 0xA034;
 
 uint16_t composeVsSnifferReq(uint8_t *frame, const uint8_t sourceMac[6], bool enable) {

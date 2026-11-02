@@ -6,15 +6,19 @@
 
 ## News
 
+- **Unjoined in-modem decrypt (V7014):** the local modem no longer joins the powerline network to
+  make the traffic visible. It stays a passive, non-member listener, recovers the session key and
+  decrypts the charging traffic inside the modem, and delivers the plaintext to the host - a less
+  intrusive sniffer than the earlier join-and-forward firmware. This ESP32 firmware now pairs with
+  the V7014 modem image (`qca-modem-firmware/make_v7014_release.py`); the older `PINGPONG-RELEASE-5`
+  pair is in the git history. Flash the ESP32 and the modem from the same commit.
 - Milestone reached: also for the AR7420 we have now a transparent sniffer software, see [pyPLC](https://github.com/uhi22/pyPLC#2026-10-09-ar7420-full-transparency-sniffer)
 - **ccs32dave works in a real-world charging session:** sniffing tested successfully on a Hyundai Ioniq
   charging at an Alpitronic HYC300. See the [video on YouTube](https://www.youtube.com/watch?v=CvkjcjtfIfo).
 - **Live DIN 70121 decode**, both directions: target/present voltage and
   current, SoC and the last message name and response code, updating in real time on the TFT.
-- **Fully autonomous transparency:** the local modem forwards the traffic in both directions by
-  itself, and a session start is captured completely (SDP request *and* response).
 - **New two-column screen:** a prominent V2G value panel next to the frame log, plus a splash screen at boot (project name, GitHub link, build date, local modem version).
-- **Beacon meter:** when not joined, shows whether a charger's modem (CCo) is in sight and how well its beacons are received.
+- **Beacon meter:** shows whether a charger's modem (CCo) is in sight and how well its beacons are received, from the modem's 250 ms status frame.
 - **Stale values fade out:** V2G values that are no longer updated turn gray.
 - **Page 2 (push button):** SDP transport security (TLS or not) and the XML schemas offered by the car and selected by the charger. A red `TLS` in the header warns that the session is encrypted.
 - **Page 3 (push button):** the charge parameter discovery - the car's limits next to the charger's, so it is visible which side caps the session.
@@ -29,10 +33,10 @@ At boot, a **splash screen** shows for ~5 s: project name, GitHub link, build da
 The main screen shows:
 
 - The local modem's status (SPI signature)
-- Whether the local modem has joined a powerline network, with its role (vendor `VS_NW_INFO`, polled every second). If not joined: `beacons` plus a 5-segment meter while a CCo's beacons are received, otherwise `not joined`. The modem's own TEI is not shown, because the special firmware rewrites it for every frame
+- A **beacon meter** (`beacons` + 5 segments): how well a charger's modem (CCo) is being received, from the delimiter counts in the modem's 250 ms status frame. Grey and empty when no status frame or no beacons arrive. The V7014 modem never joins a network, so there is no join/role/TEI to show.
 - Up to 3 modems in the network with MAC and software version (HomePlug `GET_SW`). The local modem, whose MAC ends in `FF:FF:11`, is marked with `*`.
 - Below the modem panel, two columns: a **frame log** on the left (events, MME/message names, UDP) and a prominent **V2G value panel** on the right - big stacked numbers for target/present voltage and current, SoC, the last decoded message name and its response code
-- Traffic and SPI counters
+- Traffic, delimiter (SOF/SACK, from the status frame) and SPI counters
 - In the header: the uptime in seconds with **10 ms resolution**, refreshed every **50 ms** (20 Hz), and a red `TLS` once the charger's SDP response selected TLS (orange `TLS?` if only the car's request asked for it)
 
 A push button (see "Page button" below) cycles through the nine pages and back to the main page. Over the serial line, `page <n>` jumps straight to one.
@@ -84,7 +88,7 @@ been quiet for 3 s:
 +-------------------------------------------------------+
 | ccs32dave       (yellow, size 2)       [    1234.56s] |
 |---------------------------------------------------------
-| Modem OK (green/red)     joined STA TEI2  (size 2)     |
+| Modem OK (green/red)     beacons [#####]  (size 2)     |
 | *04:65:65:FF:FF:11 <local version>            (cyan)   |
 |  98:48:27:5A:3C:E4 QCA7420-1.4.0.20-00-20171027-CS     |
 |  04:65:65:FF:FF:FF QCA7005-1.1.0.730-04-20140815-CS    |
@@ -204,37 +208,41 @@ The chosen GPIOs are free on every ESP32-S3 module variant. The wiring avoids GP
 - **Supply:** check the modem board's supply voltage before connecting. The SPI lines must be 3.3 V logic.
 - **No interrupt:** the sketch polls the modem's receive buffer every 10 ms instead of using INT.
 - **Diagnosis:** if the display shows `Modem: missing`, the signature read didn't return `AA55`. `FFFF` or `0000` usually means a wiring problem (MISO, CS, CLK) or no supply. While the signature is wrong, the serial port prints all internal registers every second (`QCA regs: ...`). If they all have the same value, the modem isn't decoding the commands.
-- **Tested with:** local QCA7005 running a special sniffer firmware (MAC `04:65:65:FF:FF:11`, self-arming both-direction transparency - forwards the traffic between the car and the charger to the host in both directions, on its own, without any external control), on a testbench with a PEV modem (QCA7005, `MAC-QCA7005-1.1.0.730-04-20140815-CS`) and an EVSE modem (QCA7420, `MAC-QCA7420-1.4.0.20-00-20171027-CS`). Serial output after a reset, once the local modem has joined the network:
+- **Tested with:** local QCA7005 running the V7014 sniffer firmware (MAC `04:65:65:FF:FF:11`, unjoined in-modem decrypt - it never joins the network, decrypts the overheard traffic in the modem and delivers the plaintext to the host in both directions, on its own), on a testbench with a PEV modem (QCA7005, `MAC-QCA7005-1.1.0.730-04-20140815-CS`) and an EVSE modem (QCA7420, `MAC-QCA7420-1.4.0.20-00-20171027-CS`). Serial output after a reset:
   ```
   QCA7005 signature: AA55 (OK)
   ccs32dave started
   Modems: 1
     * 04:65:65:FF:FF:11 <local version>
-  Network: joined, TEI 2, role 0
-  Modems: 3
-    * 04:65:65:FF:FF:11 <local version>
-      98:48:27:5A:3C:E4 MAC-QCA7420-1.4.0.20-00-20171027-CS
-      04:65:65:FF:FF:FF MAC-QCA7005-1.1.0.730-04-20140815-CS
   ```
-  At the start of each new charging session the local modem resets, and the signature reads `0000` for up to 1 s.
+  The local modem never joins, so it stays the only station it reports. Other modems answer
+  `GET_SW` on the powerline, so the modem table may still list the PEV and EVSE modems while a
+  session runs.
 
 #### QCA7005 sniffer firmware
 
-The local modem needs the special sniffer firmware `PINGPONG-RELEASE-5`. This repository doesn't
-contain that firmware, because it is based on the modem vendor's firmware. Instead,
-`qca-modem-firmware/make_pingpong_release_5.py` builds the image from an original flash image
-that you obtain yourself:
+This ESP32 firmware pairs with the QCA7005 sniffer firmware **V7014**, built by
+`qca-modem-firmware/make_v7014_release.py`. (The earlier join-and-forward `PINGPONG-RELEASE-5`
+firmware and its builder are in the git history; flash the matching pair from one commit.)
+
+V7014 is an **unjoined in-modem decrypt** sniffer: the modem never joins the powerline network. It
+passively overhears the charging traffic, recovers the session key and decrypts the payload inside
+the modem, and delivers the plaintext to the host as native IPv6 frames plus a 250 ms status frame
+(which drives the beacon meter and the SOF/SACK counters). This repository doesn't contain the
+firmware, because it is based on the modem vendor's firmware; the script builds the image from an
+original flash image that you obtain yourself:
 
 1. The input is an original 2 MB SPI flash image with the QCA7005 firmware
    `MAC-QCA7005-1.1.0.730-04-20140815-CS`. Apart from the per-device parameter blocks (PIB:
    MAC address, keys), it must be identical to the image this release was tested with. The
    script checks this and refuses anything else. Your image's own keys are kept. The file name
-   doesn't matter; the default is `original_1.1.0.730-04-CS-20140815.bin`.
+   doesn't matter; the default is `original_1.1.0.730-04-CS-20140815.bin`. (The same original
+   image also works with the older `make_pingpong_release_5.py` in the git history.)
 2. Build the image (only Python 3 is needed):
    ```
-   python qca-modem-firmware/make_pingpong_release_5.py original_1.1.0.730-04-CS-20140815.bin
+   python qca-modem-firmware/make_v7014_release.py original_1.1.0.730-04-CS-20140815.bin
    ```
-   This writes `qca_flash_PINGPONG-RELEASE-5.bin` with the MAC `04:65:65:FF:FF:11`. Use
+   This writes `qca_flash_V7014.bin` with the MAC `04:65:65:FF:FF:11`. Use
    `--mac` for a different one. The MAC must differ from every other modem on the line. The input
    dump uses `04:65:65:FF:FF:FF`, like many other boards (e.g. Foccci).
 3. Write the image to the QCA7005's SPI flash with any SPI flash programmer. One way is a
@@ -243,14 +251,12 @@ that you obtain yourself:
 
 The modem only boots a compressed firmware of exactly the right size, so the script checks that
 its result is bit-identical to the build tested on hardware. If it isn't, the script stops and
-writes nothing. It was tested on Windows 10 x64 with Python 3.11.7, Ubuntu 24.04 (WSL) with
-Python 3.12.3 and Raspbian 11 (armv7l) with Python 3.9.2.
+writes nothing. It was tested on Windows 10 x64 with Python 3.11.7.
 
-**Disclaimer, use at your own risk, no warranty:** flashing can leave the modem unusable until
-it is flashed again with a working image. The sniffer firmware joins the network of any charging
-session it observes and forwards that session's traffic. Use it only on your own equipment or
-where you are allowed to, and be aware that an extra station in the network can affect the
-charging session.
+**Disclaimer, use at your own risk, no warranty:** flashing can leave the modem unusable until it
+is flashed again with a working image. This firmware passively decrypts the charging traffic it
+overhears, in the modem. Use it only on your own equipment or where you are allowed to, and be
+aware that even a passive, non-joining station in range can in principle affect a charging session.
 
 ### Page button
 
@@ -366,12 +372,11 @@ labels, and does the first modem check.
 
 | Interval | Task |
 |---|---|
-| 1 s | `checkModem()`: reads the signature register (`0xAA55` = modem present). If the modem disappears, the modem table and network status are cleared. When it comes back, the requests are sent immediately. |
+| 1 s | `checkModem()`: reads the signature register (`0xAA55` = modem present). If the modem disappears, the modem table is cleared and the beacon meter goes stale. When it comes back, the requests are sent immediately. |
 | 5 s | `sendRequests()`: broadcast `GET_SW.REQ` for the modem list; modems that didn't answer for 3 cycles (15.5 s) are removed |
-| 1 s | `sendStatusRequests()`: `VS_NW_INFO.REQ` to the local modem only (not onto the powerline) for the join status, then `VS_SNIFFER.REQ` with the wanted sniffer state. Both stop after `bcast 0` on the serial port (`diag`) |
+| 1 s | `sendStatusRequests()`: only re-sends `VS_SNIFFER.REQ` while the sniffer stream is forced on via `sniff on` (`diag`). The V7014 modem emits its 250 ms status frame on its own, so nothing is polled for it. |
 | 10 ms | `qca.poll()`: if the modem reports received data (`RDBUF_BYTE_AVA`), reads it, splits it into Ethernet frames and passes each one to `onEthFrame()` (see below) |
 | per poll | `diag.loop()`: serial diagnosis commands (`rd`/`wr`/`nwi`/`pp`/`stat`/`qreset`/`bcast`/`log`) |
-| every pass | `updateBeaconActive()`: beacon label on/off and meter level; redraws right away on a change (max. 200 ms from beacon to screen) |
 | every pass | `pollPageButton()`: on a debounced press, `showPage()` clears everything below the header and redraws the other page |
 | 50 ms | Uptime display |
 | on change, and every 500 ms | `drawHeaderHint()` (`TLS`), then `drawPanel()` (main page) or `drawPage2()`: redraws only the text lines whose content or color changed (the 500 ms tick lets stale values fade) |
@@ -380,11 +385,13 @@ labels, and does the first modem check.
 `onEthFrame()` first offers the frame to `diag` (answers to a pending serial command are consumed
 there, not shown as traffic), then sorts the rest:
 
-- **`GET_SW.CNF`:** added to the modem table. Once the local modem has joined a network, every modem in it answers.
-- **`CM_NW_INFO.CNF`:** only the answer of the local modem sets the join status (number of networks > 0 means joined).
-- **`VS_SNIFFER` (`0xA034`-`0xA036`):** not logged and not counted as traffic. Of the `.IND`s, only
-  beacons the modem received count for the beacon display; the stream also reports the modem's own
-  transmissions.
+- **Status frame (`0x88E1`, MMTYPE `0x0000`, payload `STAT`):** the V7014 modem's own 250 ms telemetry
+  frame. Parsed for the cumulative beacon/SOF/SACK delimiter counts; the beacon meter is the per-frame
+  delta of the beacon count, SOF/SACK are shown on the counter line. Not logged.
+- **`GET_SW.CNF`:** added to the modem table. Other modems answer `GET_SW` on the powerline, so the
+  PEV and EVSE modems may appear even though the local modem never joins.
+- **`VS_SNIFFER` (`0xA034`-`0xA036`):** not logged and not counted as traffic. The stream is off by
+  default (the status frame replaces it); it is enabled only by `sniff on` (`diag`) as a raw test aid.
 - **Other HomePlug MMEs:** counted and added to the frame log (e.g. `SLAC_MATCH.CNF`).
 - **IPv6 UDP:** counted. SDP request/response (V2GTP payload type `0x9000`/`0x9001`) is decoded for
   page 2 and logged as e.g. `SDP req no TLS TCP`; other UDP frames are logged with protocol and ports.
@@ -395,8 +402,8 @@ there, not shown as traffic), then sorts the rest:
 
 Every counted frame's raw description is printed on the serial port unconditionally via
 `logFrame()` (command `log 0` turns this off); it includes TCP flags/sequence/payload-length/V2GTP-
-length for TCP. Changes of the modem table, join status, and the shown V2G values are always
-printed, independent of that setting (same convention: print on change, not on every event).
+length for TCP. Changes of the modem table and the shown V2G values are always printed, independent
+of that setting (same convention: print on change, not on every event).
 
 ### Modules
 
@@ -406,7 +413,7 @@ printed, independent of that setting (same convention: print on change, not on e
   a wedged QCA needs a real reset line pulse), and the framing `AA AA AA AA | length | 00 00 |
   frame | 55 55` for sending and receiving Ethernet frames. It counts TX/RX/rejected frames and
   errors.
-- **`homeplug`:** builds `GET_SW.REQ` (Qualcomm vendor MME `0xA000`, OUI `00:B0:52`) and `CM_NW_INFO.REQ` (`0x6038`, MMV 1), plus the vendor MMEs `VS_RD_MEM`/`VS_WR_MEM`/`VS_NW_INFO` (`0xA008`/`0xA004`/`0xA038`) used by `diag` to talk to a specially patched local modem over SPI instead of Ethernet, and `VS_SNIFFER.REQ` (`0xA034`, stock firmware) with a check for received beacon indications. It parses the matching `.CNF`s, and turns MMTYPEs into readable names.
+- **`homeplug`:** builds `GET_SW.REQ` (Qualcomm vendor MME `0xA000`, OUI `00:B0:52`), the vendor MMEs `VS_RD_MEM`/`VS_WR_MEM`/`VS_NW_INFO` (`0xA008`/`0xA004`/`0xA038`) used by `diag` to talk to the patched local modem over SPI, and `VS_SNIFFER.REQ` (`0xA034`, stock firmware) for the `sniff on` test aid. It parses the matching `.CNF`s, parses the V7014 status frame (`parseStatusFrame`), and turns MMTYPEs into readable names.
 - **`modem_list`:** table of up to 3 modems, keyed by MAC, with the local modem always first. Entries expire when a modem stops answering.
 - **`diag`:** serial command interface, including `sniff on|auto` and `page <n>` (see its own header for the full list) - the diagnosis
   channel for a modem that has no other host link (no JTAG, no Ethernet to the QCA on this board).
@@ -441,21 +448,21 @@ blocking - nothing else needs to run during it.
   `CurrentDemandRes` doesn't repeat the target values) until a newer message updates them. A value
   not updated for 2 s turns mid-gray, after 4 s dark gray. Each row is its own `TextLine`, so only
   the ones that actually changed get redrawn.
-- **Beacon meter:** when not joined, the network line shows `beacons` (orange) and 5 segments, one
-  per beacon received in the last ~200 ms (a CCo beacons every 40 ms, so 5 = all received). It goes
-  back to `not joined` 150 ms after the last beacon. The sniffer is switched on during the splash
-  screen already, so the meter works as soon as the main screen appears.
+- **Beacon meter:** the network line always shows `beacons` (orange) and 5 segments, driven by the
+  V7014 modem's 250 ms status frame: the level is the number of beacons the modem received in the
+  last status interval (a CCo beacons every ~40 ms, so ~6 arrive per 250 ms and the meter sits full),
+  capped at 5. It turns grey and empties when no status frame arrives within ~1.2 s (e.g. the modem
+  is absent, or still runs the old join-and-forward firmware, which sends no status frame).
 
-  The sniffer runs **only while the modem is not joined**. Sniffing as a member of the network
-  disturbs the running charging session: measured inside one session, the charger's own message
-  rate fell from 318 per 20 s to 18, and recovered after switching the sniffer off. The serial
-  command `sniff on` forces it anyway and exists only for that test.
+  The V7014 modem never joins the network, so there is no "joined/not joined" state. The
+  `VS_SNIFFER.IND` delimiter stream is **not** used for the meter and is left off; `sniff on` (serial)
+  turns it on only as a raw test aid.
 - **Frame log:** a ring buffer of 14 entries, narrowed (not shortened) to make room for the panel:
   uptime in whole seconds, MME/message name (still the full 20 characters it always had), and the
   last **2** bytes of the source MAC (was 3 - the extra byte wasn't worth the width once the panel
   needed it more). Consecutive identical entries are combined (`x10`, may get silently clipped by
-  the narrower canvas on a very repetitive line - cosmetic only). Events (modem OK/missing,
-  joined/not joined) are shown in yellow; decoded V2G messages in green, decode errors in red. The
+  the narrower canvas on a very repetitive line - cosmetic only). Events (modem OK/missing) are
+  shown in yellow; decoded V2G messages in green, decode errors in red. The
   log is rendered into a `GFXcanvas16` sized to the narrowed column and sent as one bitmap, at most
   every 200 ms.
 - **Uptime:** read from `esp_timer_get_time()`, which is 64-bit microseconds, so it doesn't overflow after 49 days like `millis()`. The fixed-width string `%8llu.%02us` is rendered into a 72×8 canvas and sent in one `drawRGBBitmap()` call. This avoids flicker.

@@ -1,5 +1,5 @@
 // ESP32-S3 + ILI9341 SPI TFT (240x320) + QCA7005 HomePlug modem
-// Shows the modem status, the network join status, the modems in the network
+// Shows the modem status, a beacon meter (from the modem's 250 ms status frame), the modems in the network
 // with their software versions, a log of the received frames, and the uptime
 // in seconds (10 ms resolution, refreshed every 50 ms).
 //
@@ -43,11 +43,9 @@
 #define QCA_CHECK_INTERVAL_MS   1000   // signature check
 #define QCA_REQUEST_INTERVAL_MS 5000   // GET_SW.REQ broadcast (modem list)
 #define QCA_MAX_AGE_MS          (3 * QCA_REQUEST_INTERVAL_MS + 500)
-// Join status of the local modem: VS_NW_INFO.REQ, sent only to the local modem (not onto the
-// powerline), every second. The sniffer's desired state is re-sent in the same cycle, so a lost
-// VS_SNIFFER.REQ or a modem reset heals within a second.
+// Status cycle (backlog-0199: no VS_NW_INFO poll any more). Only the sniffer's forced state is
+// maintained here, and that sends a frame only while `sniff on` is active.
 #define QCA_STATUS_INTERVAL_MS  1000
-#define QCA_STATUS_MAX_AGE_MS   3500   // join status counts as unknown after this
 
 // Sniffer rule (backlog_0006, revised 2026-09-17): on while the local modem is not joined, off
 // while joined. `sniff on` (diag) keeps it on regardless - a test aid to produce the .IND load of a
@@ -98,12 +96,9 @@ ModemStatus modem;
 
 ModemList modems;
 
-struct NetworkStatus {
-  bool valid = false;  // CM_NW_INFO.CNF received from the local modem recently
-  uint32_t receivedMs = 0;
-  homeplug::NetworkInfo info;
-};
-NetworkStatus network;
+// backlog-0199: the old join-state tracking (NetworkStatus + the VS_NW_INFO.REQ poll) is gone. The
+// v7014 sniffer never joins, so join status is meaningless; the beacon meter comes from the status
+// frame instead (StatusState above).
 
 struct TrafficStats {
   uint32_t mme = 0;    // HomePlug frames other than the answers to our requests
@@ -125,6 +120,21 @@ struct SnifferStatus {
   uint8_t levelMin = 255, levelMax = 0, levelChanges = 0;  // for the SNIF summary line
 };
 SnifferStatus sniffer;
+
+// backlog-0199: the v7014 unjoined-decrypt firmware never joins and does not use VS_SNIFFER.IND.
+// Its 250 ms status frame (homeplug::parseStatusFrame) is the telemetry channel; the beacon meter
+// is driven from the delta of its cumulative BEACON counter between two frames (~250 ms apart; a
+// CCo beacons every ~40 ms, so a fully-received train is ~6/interval, capped at the 5 segments).
+#define STATUS_FRAME_MAX_AGE_MS 1200   // no status frame for this long -> meter stale (empty/grey)
+struct StatusState {
+  bool valid = false;         // at least one status frame seen
+  uint32_t lastMs = 0;        // arrival time of the last status frame
+  bool havePrev = false;      // a previous BEACON count is stored (for the delta)
+  uint32_t prevBeacon = 0;
+  uint32_t beacon = 0, sof = 0, sack = 0;  // latest cumulative counts
+  uint8_t beaconLevel = 0;    // beacons in the last interval, capped at SNIFFER_METER_SEGMENTS
+};
+StatusState status;
 
 bool panelDirty = true;
 
@@ -211,6 +221,33 @@ void handleSnifferInd(const uint8_t *frame, uint16_t len) {
     sniffer.beaconTimes[sniffer.beaconTimesNext] = sniffer.lastBeaconMs;
     sniffer.beaconTimesNext = (sniffer.beaconTimesNext + 1) % 8;
   }
+}
+
+// backlog-0199: the QCA-DUT's 250 ms status frame. The beacon meter is driven from the delta of
+// the cumulative BEACON counter between successive frames (counts restart at 0 only on a cold
+// power-cycle; across a warm reflash the absolute value carries over, but the delta stays correct).
+bool handleStatusFrame(const uint8_t *frame, uint16_t len) {
+  homeplug::StatusFrame s;
+  if (!homeplug::parseStatusFrame(frame, len, s)) {
+    return false;
+  }
+  status.valid = true;
+  status.lastMs = millis();
+  status.beacon = s.beacon;
+  status.sof = s.sof;
+  status.sack = s.sack;
+  uint8_t level = 0;
+  if (status.havePrev) {
+    uint32_t delta = s.beacon - status.prevBeacon;  // unsigned: wrap-safe
+    level = delta > SNIFFER_METER_SEGMENTS ? SNIFFER_METER_SEGMENTS : (uint8_t)delta;
+  }
+  status.prevBeacon = s.beacon;
+  status.havePrev = true;
+  if (level != status.beaconLevel) {
+    status.beaconLevel = level;
+    panelDirty = true;
+  }
+  return true;
 }
 
 // Beacon meter right of the "beacons" label on the network line (text size 2 -> 16 px high).
@@ -383,8 +420,11 @@ static void splashHandleFrame(const uint8_t *frame, uint16_t len) {
   if (homeplug::etherType(frame) != homeplug::ETHERTYPE_HOMEPLUG) {
     return;
   }
+  if (handleStatusFrame(frame, len)) {  // QCA-DUT 250 ms status frame (beacon meter source)
+    return;
+  }
   if (homeplug::mmtype(frame) == homeplug::MMTYPE_VS_SNIFFER_IND) {
-    handleSnifferInd(frame, len);  // beacons already count while the splash is shown
+    handleSnifferInd(frame, len);  // only when the sniffer is forced on via diag
     return;
   }
   if (splashLocalVersion[0]) {
@@ -442,10 +482,8 @@ void showSplashScreen() {
 
     if (!requested && qca.readSignature() == Qca7000::SIGNATURE) {
       qca.sendEthFrame(frame, homeplug::composeGetSwReq(frame, MY_MAC));
-      // Sniffer on right away (backlog-0056): otherwise beacon detection only starts with the
-      // first sendRequests() after the splash. No traffic has been seen yet, so "idle" holds.
-      qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, true));
-      sniffer.enabled = true;
+      // backlog-0199: do NOT enable VS_SNIFFER.IND. The v7014 firmware emits a 250 ms status frame
+      // on its own (beacon meter source); the sniffer stream is only turned on by `sniff on` (diag).
       requested = true;
     }
     if (requested) {
@@ -1081,35 +1119,21 @@ void drawPanel() {
   drawLine(statusLine, modem.present ? ILI9341_GREEN : ILI9341_RED,
            modem.present ? "Modem OK" : "No modem");
 
-  // Network join status from CM_NW_INFO.CNF of the local modem
-  static const char *const ROLE[] = {"STA", "PCo", "CCo"};
-  // backlog-0056: "beacons" + meter shares the network line. The short label leaves room for the
-  // meter; every other text uses the full width again, and its padding erases the meter.
-  bool showMeter = modem.present && network.valid && network.info.numNetworks == 0 &&
-                   sniffer.beaconActive;
-  uint8_t networkCols = showMeter ? 7 : 0;
-  if (networkLine.cols != networkCols) {
-    networkLine.cols = networkCols;
+  // backlog-0199: the v7014 sniffer never joins, so there is no "joined/not joined/role" state to
+  // show. The network line is permanently the beacon meter, fed from the 250 ms status frame's
+  // cumulative BEACON counter (handleStatusFrame computes the per-interval level). "beacons" =
+  // a CCo's beacons are being received; the meter fills as the train comes in. Grey + empty when
+  // no status frame has arrived recently (STATUS_FRAME_MAX_AGE_MS) or the modem is absent.
+  bool meterStale = !status.valid || (millis() - status.lastMs > STATUS_FRAME_MAX_AGE_MS);
+  bool meterLive = modem.present && !meterStale;
+  uint8_t level = meterLive ? status.beaconLevel : 0;
+  if (networkLine.cols != 7) {  // "beacons" (7 chars) leaves room for the meter to its right
+    networkLine.cols = 7;
     networkLine.drawn = false;
     meterShown = -1;
   }
-  if (!modem.present || !network.valid) {
-    drawLine(networkLine, COLOR_DARKGREY, "Net ?");
-  } else if (network.info.numNetworks == 0) {
-    // "beacons" = a CCo is RF-reachable (received beacons) but never talks to us. beaconActive and
-    // beaconLevel are updated on every loop() pass (updateBeaconActive()), not on the panel tick.
-    if (showMeter) {
-      drawLine(networkLine, ILI9341_ORANGE, "beacons");
-      drawBeaconMeter(sniffer.beaconLevel);
-    } else {
-      drawLine(networkLine, ILI9341_YELLOW, "not joined");
-    }
-  } else {
-    // No TEI here: the ping-pong firmware flips the modem's own TEI per frame, so it says nothing
-    // and would only make the line flicker.
-    snprintf(buf, sizeof(buf), "joined %s", network.info.role < 3 ? ROLE[network.info.role] : "?");
-    drawLine(networkLine, ILI9341_GREEN, buf);
-  }
+  drawLine(networkLine, meterLive ? ILI9341_ORANGE : COLOR_DARKGREY, "beacons");
+  drawBeaconMeter(level);
 
   // One line per modem: "*MAC version", * = local modem
   for (uint8_t i = 0; i < ModemList::MAX_MODEMS; i++) {
@@ -1179,10 +1203,13 @@ void drawPanel() {
     drawLine(rcLine, ILI9341_RED, buf);
   }
 
-  snprintf(buf, sizeof(buf), "MME %lu IPv6 %lu  SPI TX %lu RX %lu err %lu %04X",
+  // backlog-0199: SOF/SACK are the status-frame RX delimiter counts (cumulative; 0 until a v7014
+  // modem sends status frames). The signature hex was dropped to make room ("Modem OK" covers it).
+  snprintf(buf, sizeof(buf), "MME %lu IPv6 %lu SOF %lu SACK %lu TX %lu RX %lu e%lu",
            (unsigned long)traffic.mme, (unsigned long)traffic.ipv6,
+           (unsigned long)status.sof, (unsigned long)status.sack,
            (unsigned long)qca.txFrames(), (unsigned long)qca.rxFrames(),
-           (unsigned long)qca.errors(), modem.signature);
+           (unsigned long)qca.errors());
   drawLine(counterLine, COLOR_DARKGREY, buf);
 }
 
@@ -2128,6 +2155,10 @@ void logFrame(const uint8_t *frame, uint16_t len, const char *description) {
 
 void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
   uint16_t mm = homeplug::mmtype(frame);
+  if (mm == 0x0000 && handleStatusFrame(frame, len)) {
+    // QCA-DUT 250 ms status frame (v7014): telemetry + beacon meter source. Not logged.
+    return;
+  }
   if ((mm & 0xFFFC) == 0xA034) {
     // The whole VS_SNIFFER family (REQ 0xA034, CNF 0xA035 = ack for our own toggle, IND 0xA036)
     // is ours: not logged, not counted as traffic.
@@ -2146,39 +2177,7 @@ void onHomeplugFrame(const uint8_t *frame, uint16_t len) {
     return;
   }
 
-  homeplug::VsNetworkInfo vs;
-  if (homeplug::parseVsNwInfoCnf(frame, len, vs)) {
-    // Answer to our 1 s VS_NW_INFO.REQ (sent to the local modem only)
-    if (ModemList::isLocal(vs.mac)) {
-      homeplug::NetworkInfo info;
-      memset(&info, 0, sizeof(info));
-      memcpy(info.mac, vs.mac, 6);
-      info.numNetworks = vs.numAvlns;
-      info.tei = vs.ownTei;
-      info.role = vs.role;  // same coding as CM_NW_INFO: 0 STA, 1 PCo, 2 CCo
-      memcpy(info.ccoMac, vs.ccoMac, 6);
-      // The own TEI is deliberately NOT compared: the ping-pong firmware rewrites it per frame
-      // (bench 2026-09-17: it alternated every second), which would log and redraw constantly.
-      bool changed = !network.valid ||
-                     network.info.numNetworks != info.numNetworks ||
-                     network.info.role != info.role;
-      if (changed) {
-        Serial.printf("Network: %s, role %u\n", info.numNetworks > 0 ? "joined" : "not joined",
-                      info.role);
-        char buf[24];
-        strlcpy(buf, info.numNetworks > 0 ? "** joined" : "** not joined", sizeof(buf));
-        addLog(buf, ILI9341_YELLOW);
-        panelDirty = true;
-      }
-      network.info = info;
-      network.valid = true;
-      network.receivedMs = millis();
-      if (changed) {
-        updateSnifferState();  // switch the sniffer right away, not a cycle later
-      }
-    }
-    return;
-  }
+  // backlog-0199: VS_NW_INFO.CNF (join status) is no longer requested or handled.
 
   // SLAC (backlog_0014/0015/0017). The whole run happens BEFORE the match that opens the
   // session, so its start and its attenuation profile are kept outside the session data and
@@ -2399,7 +2398,7 @@ void checkModem() {
       addLog("** modem OK", ILI9341_YELLOW);
     } else {
       modems.clear();
-      network.valid = false;
+      status.valid = false;  // no modem -> no status frames -> beacon meter stale
       addLog("** modem missing", ILI9341_RED);
     }
     modem.signature = signature;
@@ -2452,34 +2451,29 @@ void sendRequests(uint32_t now) {
   panelDirty = true;  // counters changed
 }
 
-// Sends the sniffer's desired state: on while not joined (or join status unknown), off while
-// joined, always on after `sniff on`. Sent every status cycle, not only on a change -
-// VS_SNIFFER.REQ has no retry of its own, and a modem reset switches the sniffer off.
+// backlog-0199: the beacon meter is driven by the 250 ms status frame, so the VS_SNIFFER.IND
+// stream is NOT enabled in normal operation. It is turned on only as a raw diagnostic via
+// `sniff on` (diag.snifferForced()); otherwise the desired state is "off" and we send nothing
+// (the v7014 modem boots with the sniffer off). Sent every status cycle when forced, since
+// VS_SNIFFER.REQ has no retry and a modem reset clears it.
 void updateSnifferState() {
-  bool joined = network.valid && network.info.numNetworks > 0;
-  bool wanted = diag.snifferForced() || !joined;
-  uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
-  qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, wanted));
+  bool wanted = diag.snifferForced();
+  if (wanted) {
+    uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
+    qca.sendEthFrame(frame, homeplug::composeVsSnifferReq(frame, MY_MAC, true));
+  }
   if (wanted != sniffer.enabled) {
     sniffer.enabled = wanted;
-    Serial.printf("Sniffer: %s (%s)\n", wanted ? "enabled" : "disabled",
-                  diag.snifferForced() ? "forced" : joined ? "joined" : "not joined");
+    Serial.printf("Sniffer: %s (diag)\n", wanted ? "forced on" : "off");
     addLog(wanted ? "** sniffer on" : "** sniffer off", ILI9341_YELLOW);
     panelDirty = true;
   }
 }
 
-// Every QCA_STATUS_INTERVAL_MS: join status of the local modem, then the sniffer state.
+// Every QCA_STATUS_INTERVAL_MS. backlog-0199: no VS_NW_INFO poll any more (join status is gone);
+// only the sniffer state is maintained, and that sends a frame only while `sniff on` is forced.
 void sendStatusRequests(uint32_t now) {
-  static const uint8_t LOCAL_MODEM_MAC[6] = {0x04, 0x65, 0x65, 0xFF, 0xFF, 0x11};
-  uint8_t frame[homeplug::MIN_ETH_FRAME_LEN];
-  qca.sendEthFrame(frame, homeplug::composeVsNwInfoReq(frame, LOCAL_MODEM_MAC, MY_MAC));
-
-  if (network.valid && now - network.receivedMs > QCA_STATUS_MAX_AGE_MS) {
-    network.valid = false;
-    Serial.println("Network: unknown (no VS_NW_INFO answer)");
-    panelDirty = true;
-  }
+  (void)now;
   updateSnifferState();
 }
 
