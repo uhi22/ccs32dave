@@ -12,7 +12,7 @@
   intrusive sniffer than the earlier join-and-forward firmware. This ESP32 firmware now pairs with
   the V7014 modem image (`qca-modem-firmware/make_v7014_release.py`); the older `PINGPONG-RELEASE-5`
   pair is in the git history. Flash the ESP32 and the modem from the same commit.
-- Milestone reached: also for the AR7420 we have now a transparent sniffer software, see [pyPLC](https://github.com/uhi22/pyPLC#2026-10-09-ar7420-full-transparency-sniffer)
+- Milestone reached: also for the AR7420 we have now a transparent sniffer software, see [pyPLC](https://github.com/uhi22/pyPLC#2026-10-09-ar7420-full-transparency-sniffer) and the ccs32ebony project [ccs32ebony](https://github.com/uhi22/ccs32ebony)
 - **ccs32dave works in a real-world charging session:** sniffing tested successfully on a Hyundai Ioniq
   charging at an Alpitronic HYC300. See the [video on YouTube](https://www.youtube.com/watch?v=CvkjcjtfIfo).
 - **Live DIN 70121 decode**, both directions: target/present voltage and
