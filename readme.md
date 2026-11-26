@@ -473,3 +473,10 @@ blocking - nothing else needs to run during it.
 - [Ref2] YouTube  video of a real-world charging session (Hyundai Ioniq at Alpitronic HYC300): https://www.youtube.com/watch?v=CvkjcjtfIfo
 - [Ref3] Prior work, pyPLC, the open source CCS communication solution: https://github.com/uhi22/pyPLC
 - [Ref4] The openinverter forum thread where all the CCS open source work started: https://openinverter.org/forum/viewtopic.php?t=2262
+
+## Support
+
+ccs32dave is a spare-time project. If it's useful for you, you can support further development:
+
+- Patreon: https://www.patreon.com/uhi22
+- PayPal: https://www.paypal.me/uhi22
